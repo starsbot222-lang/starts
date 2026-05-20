@@ -16,10 +16,11 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 # ===================== SOZLAMALAR =====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
-ADMIN_ID  = int(os.environ.get("ADMIN_ID", "6102256074"))
-DB_PATH   = "/tmp/bot.db"
-TIMEZONE  = pytz.timezone("Asia/Tashkent")
+BOT_TOKEN    = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
+ADMIN_ID     = int(os.environ.get("ADMIN_ID", "6102256074"))
+SUPPORT_GROUP = "https://t.me/FreeStarsbotInfo"   # Yordam guruhi linki
+DB_PATH      = "/tmp/bot.db"
+TIMEZONE     = pytz.timezone("Asia/Tashkent")
 # ======================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -106,6 +107,13 @@ def init_db():
             PRIMARY KEY (referrer_id, hour_key)
         )
     """)
+    # === YANGI: Yordam so'rovi cooldown jadvali ===
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS support_cooldown (
+            user_id      INTEGER PRIMARY KEY,
+            last_sent_at TIMESTAMP DEFAULT NULL
+        )
+    """)
     c.execute("INSERT OR IGNORE INTO settings VALUES ('referral_stars', '0.25')")
     c.execute("INSERT OR IGNORE INTO settings VALUES ('subscribe_stars', '0.10')")
     conn.commit()
@@ -166,7 +174,6 @@ def add_balance(user_id, amount, desc=""):
     conn.close()
 
 def deduct_balance(user_id, amount, desc=""):
-    """Balansdan ayirish. False qaytarsa — yetarli emas."""
     conn = db()
     c = conn.cursor()
     c.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
@@ -248,7 +255,6 @@ def add_order(user_id, username, full_name, gift_name, gift_emoji, gift_stars):
         (user_id, username, full_name, gift_name, gift_emoji, gift_stars)
     )
     order_id = c.lastrowid
-    # So'nggi buyurtma vaqtini yangilash
     c.execute("UPDATE users SET last_order_time=datetime('now') WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
@@ -271,7 +277,6 @@ def get_pending_orders():
 
 # ---- Referral spam tekshiruvi ----
 def check_referral_abuse(referred_by):
-    """1 soatda 5 tadan ko'p referral bo'lsa, spam deb hisoblash."""
     hour_key = datetime.now(TIMEZONE).strftime("%Y%m%d%H")
     conn = db()
     c = conn.cursor()
@@ -287,11 +292,10 @@ def check_referral_abuse(referred_by):
     count = c.fetchone()[0]
     conn.commit()
     conn.close()
-    return count <= 5  # 5 tagacha ruxsat
+    return count <= 5
 
 # ---- Double-click himoya ----
 def check_order_cooldown(user_id):
-    """So'nggi buyurtmadan 15 soniya o'tganmi?"""
     conn = db()
     c = conn.cursor()
     c.execute("SELECT last_order_time FROM users WHERE user_id=?", (user_id,))
@@ -305,6 +309,43 @@ def check_order_cooldown(user_id):
         return diff >= 15
     except Exception:
         return True
+
+# ===================== YORDAM SO'ROVI COOLDOWN =====================
+def check_support_cooldown(user_id):
+    """
+    True  → ruxsat bor (1 soat o'tgan yoki birinchi marta)
+    False → hali vaqt bo'lmagan
+    Qaytaradi: (allowed: bool, minutes_left: int)
+    """
+    conn = db()
+    c = conn.cursor()
+    c.execute("SELECT last_sent_at FROM support_cooldown WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+
+    if not row or not row[0]:
+        return True, 0
+
+    try:
+        last = datetime.fromisoformat(row[0])
+        diff = (datetime.utcnow() - last).total_seconds()
+        if diff >= 3600:  # 1 soat = 3600 soniya
+            return True, 0
+        minutes_left = int((3600 - diff) / 60) + 1
+        return False, minutes_left
+    except Exception:
+        return True, 0
+
+def update_support_cooldown(user_id):
+    conn = db()
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO support_cooldown (user_id, last_sent_at) VALUES (?, datetime('now')) "
+        "ON CONFLICT(user_id) DO UPDATE SET last_sent_at = datetime('now')",
+        (user_id,)
+    )
+    conn.commit()
+    conn.close()
 
 # ===================== GIFTS =====================
 GIFTS = [
@@ -322,18 +363,18 @@ GIFTS = [
 
 # ===================== STATES =====================
 class AdminStates(StatesGroup):
-    # Kanal qo'shish — bosqichma-bosqich
     add_channel_link     = State()
     add_channel_name     = State()
-    # Sozlamalar
     set_referral_stars   = State()
     set_subscribe_stars  = State()
     broadcast            = State()
     add_balance_input    = State()
     deduct_balance_input = State()
 
-# Vaqtinchalik ma'lumot saqlash uchun
-channel_temp = {}   # {admin_id: {"channel_id": ..., "link": ...}}
+class UserStates(StatesGroup):
+    support_message = State()   # Yordam xabari yozish holati
+
+channel_temp = {}
 
 # ===================== BOT & ROUTER =====================
 bot    = Bot(token=BOT_TOKEN)
@@ -351,6 +392,8 @@ def main_menu(user_id):
         [InlineKeyboardButton(text="📢 Kanallarga obuna",  callback_data="channels")],
         [InlineKeyboardButton(text="📋 Transaksiyalar",    callback_data="transactions")],
         [InlineKeyboardButton(text="⏰ Ish vaqti",         callback_data="work_hours")],
+        # === YANGI TUGMA: Yordam ===
+        [InlineKeyboardButton(text="🆘 Yordam / Muammo",  callback_data="support")],
     ]
     if user_id == ADMIN_ID:
         buttons.append([InlineKeyboardButton(text="🔧 Admin panel", callback_data="admin_panel")])
@@ -405,7 +448,6 @@ def back_kb(cb="back_main"):
 
 # ===================== HELPERS =====================
 async def check_subscription(user_id):
-    """Foydalanuvchi barcha kanallarga obuna bo'lganini tekshirish."""
     channels = get_channels()
     if not channels:
         return True, []
@@ -420,11 +462,6 @@ async def check_subscription(user_id):
     return len(not_subbed) == 0, not_subbed
 
 async def resolve_channel(link_or_username: str):
-    """
-    Link yoki username orqali kanal ID va nomini aniqlash.
-    Qaytaradi: (channel_id_str, title) yoki None
-    """
-    # t.me/username yoki @username shakllarini normallashtirish
     raw = link_or_username.strip()
     if raw.startswith("https://t.me/"):
         username = "@" + raw.split("t.me/")[-1].split("/")[0]
@@ -434,7 +471,6 @@ async def resolve_channel(link_or_username: str):
         username = raw
     else:
         username = "@" + raw
-
     try:
         chat = await bot.get_chat(username)
         return str(chat.id), chat.title or username
@@ -464,9 +500,7 @@ async def cmd_start(message: Message, state: FSMContext):
 
     add_user(user_id, username, full_name, referred_by)
 
-    # Yangi foydalanuvchi + referral bor
     if is_new and referred_by:
-        # Spam tekshiruvi
         if check_referral_abuse(referred_by):
             ref_stars = float(get_setting("referral_stars") or 0.25)
             add_balance(referred_by, ref_stars, f"Referral: {full_name}")
@@ -488,7 +522,6 @@ async def cmd_start(message: Message, state: FSMContext):
             except Exception:
                 pass
         else:
-            # Shubhali — adminga xabar
             try:
                 await bot.send_message(
                     ADMIN_ID,
@@ -615,8 +648,6 @@ async def show_channels(call: CallbackQuery):
 @router.callback_query(F.data == "check_sub")
 async def check_sub(call: CallbackQuery):
     user_id = call.from_user.id
-
-    # Obunani real vaqtda tekshirish
     is_subbed, not_subbed = await check_subscription(user_id)
     if not is_subbed:
         names = "\n".join([f"❌ {ch[2]}" for ch in not_subbed])
@@ -624,17 +655,13 @@ async def check_sub(call: CallbackQuery):
             f"Quyidagi kanallarga obuna bo'ling:\n{names}", show_alert=True
         )
         return
-
-    # Allaqachon bonus olganligi
     user = get_user(user_id)
-    if user and user[6] == 1:  # sub_bonus_received
+    if user and user[6] == 1:
         await call.answer("✅ Siz allaqachon obuna bonusini oldingiz!", show_alert=True)
         return
-
     sub_stars = float(get_setting("subscribe_stars") or 0.10)
     channels  = get_channels()
     total     = round(sub_stars * len(channels), 2)
-
     conn = db()
     c = conn.cursor()
     c.execute("UPDATE users SET balance = balance + ?, sub_bonus_received = 1 WHERE user_id=?",
@@ -645,9 +672,123 @@ async def check_sub(call: CallbackQuery):
     )
     conn.commit()
     conn.close()
-
     balance = get_balance(user_id)
     await call.answer(f"🎉 +{total}⭐ qo'shildi! Balans: {balance}⭐", show_alert=True)
+
+# ===================== YORDAM (SUPPORT) =====================
+
+@router.callback_query(F.data == "support")
+async def support_menu(call: CallbackQuery, state: FSMContext):
+    """Yordam sahifasini ko'rsatish."""
+    user_id = call.from_user.id
+    allowed, minutes_left = check_support_cooldown(user_id)
+
+    if not allowed:
+        await call.answer(
+            f"⏳ Siz allaqachon so'rov yubordingiz!\n"
+            f"Keyingi so'rovni {minutes_left} daqiqadan keyin yuborishingiz mumkin.",
+            show_alert=True
+        )
+        return
+
+    await call.message.edit_text(
+        f"🆘 <b>Yordam / Muammo bildirish</b>\n\n"
+        f"Agar botda muammo yoki kamchilik bo'lsa:\n\n"
+        f"1️⃣ <b>Guruhga to'g'ridan to'g'ri murojaat qiling:</b>\n"
+        f"👉 {SUPPORT_GROUP}\n\n"
+        f"2️⃣ <b>Yoki botga xabar yuboring</b> — biz guruhga forward qilamiz:\n"
+        f"(1 soatda faqat 1 marta yuborishingiz mumkin)\n\n"
+        f"📝 <b>Muammongizni quyida yozing:</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="💬 Guruhga o'tish",
+                url=SUPPORT_GROUP
+            )],
+            [InlineKeyboardButton(
+                text="✏️ Xabar yozish (botga)",
+                callback_data="support_write"
+            )],
+            [InlineKeyboardButton(text="🔙 Ortga", callback_data="back_main")],
+        ]),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+@router.callback_query(F.data == "support_write")
+async def support_write(call: CallbackQuery, state: FSMContext):
+    """Foydalanuvchidan xabar so'rash."""
+    user_id = call.from_user.id
+    allowed, minutes_left = check_support_cooldown(user_id)
+
+    if not allowed:
+        await call.answer(
+            f"⏳ {minutes_left} daqiqadan keyin yuborishingiz mumkin!",
+            show_alert=True
+        )
+        return
+
+    await state.set_state(UserStates.support_message)
+    await call.message.edit_text(
+        f"✏️ <b>Muammongizni yozing</b>\n\n"
+        f"Xabaringizni yuboring — admin ko'radi va javob beradi.\n\n"
+        f"⚠️ <b>Diqqat:</b> 1 soatda faqat 1 marta yuborishingiz mumkin.\n\n"
+        f"Bekor qilish uchun /start bosing.",
+        reply_markup=back_kb("support"),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+@router.message(UserStates.support_message)
+async def process_support_message(message: Message, state: FSMContext):
+    """Foydalanuvchi xabarini qabul qilib guruhga yo'naltirish."""
+    user_id   = message.from_user.id
+    username  = message.from_user.username or ""
+    full_name = message.from_user.full_name or ""
+
+    # Ikkinchi marta cooldown tekshiruvi (xavfsizlik uchun)
+    allowed, minutes_left = check_support_cooldown(user_id)
+    if not allowed:
+        await message.answer(
+            f"⏳ Siz allaqachon so'rov yubordingiz!\n"
+            f"{minutes_left} daqiqadan keyin qayta yuborishingiz mumkin.",
+            reply_markup=back_kb("back_main")
+        )
+        await state.clear()
+        return
+
+    uname_display = f"@{username}" if username else full_name
+
+    # Cooldownni yangilash
+    update_support_cooldown(user_id)
+    await state.clear()
+
+    # Adminga xabar yuborish
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"🆘 <b>Yordam so'rovi!</b>\n\n"
+            f"👤 Foydalanuvchi: {uname_display}\n"
+            f"🪪 ID: <code>{user_id}</code>\n"
+            f"🕐 Vaqt: {datetime.now(TIMEZONE).strftime('%d.%m.%Y %H:%M')}\n\n"
+            f"📝 <b>Xabar:</b>\n{message.text}",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Admin ga yordam xabari yuborishda xato: {e}")
+
+    # Foydalanuvchiga tasdiqlash
+    await message.answer(
+        f"✅ <b>Xabaringiz qabul qilindi!</b>\n\n"
+        f"Admin ko'rib chiqadi va tez orada javob beradi.\n\n"
+        f"💬 Shuningdek guruhimizda ham murojaat qilishingiz mumkin:\n"
+        f"👉 {SUPPORT_GROUP}\n\n"
+        f"⏳ Keyingi so'rovni 1 soatdan keyin yuborishingiz mumkin.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💬 Guruhga o'tish", url=SUPPORT_GROUP)],
+            [InlineKeyboardButton(text="🏠 Bosh menyu",    callback_data="back_main")],
+        ]),
+        parse_mode="HTML"
+    )
 
 # -------- GIFT OLISH --------
 
@@ -712,12 +853,10 @@ async def confirm_gift(call: CallbackQuery):
 
     user_id = call.from_user.id
 
-    # 1. Double-click himoya
     if not check_order_cooldown(user_id):
         await call.answer("⏳ Iltimos, 15 soniya kuting!", show_alert=True)
         return
 
-    # 2. Obunani tekshirish — gift olishdan oldin ham!
     is_subbed, not_subbed = await check_subscription(user_id)
     if not is_subbed:
         names = "\n".join([f"❌ {ch[2]}" for ch in not_subbed])
@@ -734,7 +873,6 @@ async def confirm_gift(call: CallbackQuery):
     gift    = GIFTS[idx]
     balance = get_balance(user_id)
 
-    # 3. Balans tekshiruvi (ikkinchi safar)
     if balance < gift["stars"]:
         await call.answer("❌ Stars yetarli emas!", show_alert=True)
         return
@@ -744,16 +882,13 @@ async def confirm_gift(call: CallbackQuery):
     full_name = user[2] or ""
     uname_display = f"@{username}" if username else full_name
 
-    # 4. Balansdan ayirish (xavfsiz)
     ok = deduct_balance(user_id, gift["stars"], f"Gift buyurtma: {gift['name']}")
     if not ok:
         await call.answer("❌ Stars yetarli emas!", show_alert=True)
         return
 
-    # 5. Buyurtmani saqlash
     order_id = add_order(user_id, username, full_name, gift["name"], gift["emoji"], gift["stars"])
 
-    # 6. Adminga xabar
     try:
         await bot.send_message(
             ADMIN_ID,
@@ -861,8 +996,6 @@ async def admin_orders(call: CallbackQuery):
     )
     await call.answer()
 
-# -------- KANAL QO'SHISH — BOSQICHMA-BOSQICH --------
-
 @router.callback_query(F.data == "admin_add_channel")
 async def admin_add_channel_start(call: CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -884,12 +1017,9 @@ async def admin_add_channel_start(call: CallbackQuery, state: FSMContext):
 async def process_channel_link(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
-
     raw = message.text.strip()
     await message.answer("⏳ Kanal tekshirilmoqda...")
-
     channel_id, auto_name = await resolve_channel(raw)
-
     if not channel_id:
         await message.answer(
             "❌ Kanal topilmadi!\n\n"
@@ -898,8 +1028,6 @@ async def process_channel_link(message: Message, state: FSMContext):
             reply_markup=back_kb("admin_panel")
         )
         return
-
-    # Link normalizatsiya
     raw_lower = raw.lower()
     if raw_lower.startswith("https://t.me/"):
         link = raw
@@ -909,14 +1037,11 @@ async def process_channel_link(message: Message, state: FSMContext):
         link = f"https://t.me/{raw[1:]}"
     else:
         link = f"https://t.me/{raw}"
-
-    # Vaqtinchalik saqlash
     channel_temp[message.from_user.id] = {
         "channel_id": channel_id,
         "link": link,
         "auto_name": auto_name
     }
-
     await state.set_state(AdminStates.add_channel_name)
     await message.answer(
         f"✅ Kanal topildi!\n\n"
@@ -933,21 +1058,16 @@ async def process_channel_link(message: Message, state: FSMContext):
 async def process_channel_name(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
-
     temp = channel_temp.get(message.from_user.id)
     if not temp:
         await message.answer("❌ Xatolik. Qaytadan boshlang.", reply_markup=admin_keyboard())
         await state.clear()
         return
-
     name = message.text.strip()
     add_channel(temp["channel_id"], name, temp["link"])
     admin_log(ADMIN_ID, "add_channel", f"id={temp['channel_id']}, name={name}")
-
-    # Tozalash
     channel_temp.pop(message.from_user.id, None)
     await state.clear()
-
     await message.answer(
         f"✅ <b>Kanal muvaffaqiyatli qo'shildi!</b>\n\n"
         f"📢 Nom: <b>{name}</b>\n"
@@ -956,8 +1076,6 @@ async def process_channel_name(message: Message, state: FSMContext):
         reply_markup=admin_keyboard(),
         parse_mode="HTML"
     )
-
-# -------- KANAL O'CHIRISH --------
 
 @router.callback_query(F.data == "admin_remove_channel")
 async def admin_remove_channel(call: CallbackQuery):
@@ -997,8 +1115,6 @@ async def delete_channel(call: CallbackQuery):
     ]
     buttons.append([InlineKeyboardButton(text="🔙 Ortga", callback_data="admin_panel")])
     await call.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-
-# -------- SOZLAMALAR --------
 
 @router.callback_query(F.data == "admin_set_referral")
 async def admin_set_referral(call: CallbackQuery, state: FSMContext):
@@ -1053,8 +1169,6 @@ async def process_subscribe_stars(message: Message, state: FSMContext):
         )
     except Exception:
         await message.answer("❌ Raqam kiriting! Masalan: 0.10")
-
-# -------- BALANS --------
 
 @router.callback_query(F.data == "admin_add_balance")
 async def admin_add_balance(call: CallbackQuery, state: FSMContext):
@@ -1128,8 +1242,6 @@ async def process_deduct_balance(message: Message, state: FSMContext):
         )
     except Exception:
         await message.answer("❌ Format: <code>USER_ID MIQDOR</code>", parse_mode="HTML")
-
-# -------- STATISTIKA --------
 
 @router.callback_query(F.data == "admin_stats")
 async def admin_stats(call: CallbackQuery):
