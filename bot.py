@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 import sqlite3
+from datetime import datetime
+import pytz
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
@@ -16,11 +18,18 @@ from aiogram.fsm.storage.memory import MemoryStorage
 # ===================== SOZLAMALAR =====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "6102256074"))
-DB_PATH = "/tmp/bot.db"  # Render uchun /tmp ishlatamiz
+DB_PATH = "/tmp/bot.db"
+TIMEZONE = pytz.timezone("Asia/Tashkent")
 # ======================================================
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# ===================== VAQT TEKSHIRISH =====================
+def is_working_hours():
+    now = datetime.now(TIMEZONE)
+    return 20 <= now.hour < 24
 
 
 # ===================== DATABASE =====================
@@ -33,13 +42,13 @@ def init_db():
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id       INTEGER PRIMARY KEY,
-            username      TEXT,
-            full_name     TEXT,
-            balance       REAL DEFAULT 0,
-            referred_by   INTEGER DEFAULT NULL,
+            user_id        INTEGER PRIMARY KEY,
+            username       TEXT,
+            full_name      TEXT,
+            balance        REAL DEFAULT 0,
+            referred_by    INTEGER DEFAULT NULL,
             referral_count INTEGER DEFAULT 0,
-            joined_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            joined_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     c.execute("""
@@ -64,6 +73,19 @@ def init_db():
             type        TEXT,
             description TEXT,
             created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER,
+            username   TEXT,
+            full_name  TEXT,
+            gift_name  TEXT,
+            gift_emoji TEXT,
+            gift_stars INTEGER,
+            status     TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     c.execute("INSERT OR IGNORE INTO settings VALUES ('referral_stars', '0.25')")
@@ -190,27 +212,58 @@ def get_all_users():
     return [r[0] for r in rows]
 
 
+def add_order(user_id, username, full_name, gift_name, gift_emoji, gift_stars):
+    conn = db()
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO orders (user_id, username, full_name, gift_name, gift_emoji, gift_stars) VALUES (?,?,?,?,?,?)",
+        (user_id, username, full_name, gift_name, gift_emoji, gift_stars)
+    )
+    order_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return order_id
+
+
+def complete_order(order_id):
+    conn = db()
+    c = conn.cursor()
+    c.execute("UPDATE orders SET status='done' WHERE id=?", (order_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_pending_orders():
+    conn = db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM orders WHERE status='pending' ORDER BY created_at ASC")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
 # ===================== GIFTS =====================
 GIFTS = [
-    {"id": "TgGift15Stars1",  "emoji": "💝", "name": "Heart",   "stars": 15},
-    {"id": "TgGift15Stars2",  "emoji": "🧸", "name": "Bear",    "stars": 15},
-    {"id": "TgGift25Stars1",  "emoji": "🎁", "name": "Present", "stars": 25},
-    {"id": "TgGift25Stars2",  "emoji": "🌹", "name": "Rose",    "stars": 25},
-    {"id": "TgGift50Stars1",  "emoji": "🎂", "name": "Cake",    "stars": 50},
-    {"id": "TgGift50Stars2",  "emoji": "💐", "name": "Bouquet", "stars": 50},
-    {"id": "TgGift50Stars3",  "emoji": "🚀", "name": "Rocket",  "stars": 50},
-    {"id": "TgGift100Stars1", "emoji": "🏆", "name": "Trophy",  "stars": 100},
-    {"id": "TgGift100Stars2", "emoji": "💍", "name": "Ring",    "stars": 100},
-    {"id": "TgGift100Stars3", "emoji": "💎", "name": "Diamond", "stars": 100},
+    {"emoji": "💝", "name": "Heart",   "stars": 15},
+    {"emoji": "🧸", "name": "Bear",    "stars": 15},
+    {"emoji": "🎁", "name": "Present", "stars": 25},
+    {"emoji": "🌹", "name": "Rose",    "stars": 25},
+    {"emoji": "🎂", "name": "Cake",    "stars": 50},
+    {"emoji": "💐", "name": "Bouquet", "stars": 50},
+    {"emoji": "🚀", "name": "Rocket",  "stars": 50},
+    {"emoji": "🏆", "name": "Trophy",  "stars": 100},
+    {"emoji": "💍", "name": "Ring",    "stars": 100},
+    {"emoji": "💎", "name": "Diamond", "stars": 100},
 ]
+
 
 # ===================== STATES =====================
 class AdminStates(StatesGroup):
-    add_channel        = State()
-    set_referral_stars = State()
+    add_channel         = State()
+    set_referral_stars  = State()
     set_subscribe_stars = State()
-    broadcast          = State()
-    add_balance_input  = State()
+    broadcast           = State()
+    add_balance_input   = State()
     deduct_balance_input = State()
 
 
@@ -224,12 +277,13 @@ router = Router()
 def main_menu(user_id):
     buttons = [
         [
-            InlineKeyboardButton(text="⭐ Balansim",          callback_data="balance"),
-            InlineKeyboardButton(text="👥 Referral",          callback_data="referral"),
+            InlineKeyboardButton(text="⭐ Balansim",      callback_data="balance"),
+            InlineKeyboardButton(text="👥 Referral",      callback_data="referral"),
         ],
-        [InlineKeyboardButton(text="🎁 Gift sotib olish",     callback_data="buy_gift")],
-        [InlineKeyboardButton(text="📢 Kanallarga obuna",     callback_data="channels")],
-        [InlineKeyboardButton(text="📋 Transaksiyalar",       callback_data="transactions")],
+        [InlineKeyboardButton(text="🎁 Gift olish",       callback_data="buy_gift")],
+        [InlineKeyboardButton(text="📢 Kanallarga obuna", callback_data="channels")],
+        [InlineKeyboardButton(text="📋 Transaksiyalar",   callback_data="transactions")],
+        [InlineKeyboardButton(text="⏰ Ish vaqti",        callback_data="work_hours")],
     ]
     if user_id == ADMIN_ID:
         buttons.append([InlineKeyboardButton(text="🔧 Admin panel", callback_data="admin_panel")])
@@ -238,16 +292,17 @@ def main_menu(user_id):
 
 def admin_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Kanal qo'shish",        callback_data="admin_add_channel")],
-        [InlineKeyboardButton(text="➖ Kanal o'chirish",       callback_data="admin_remove_channel")],
-        [InlineKeyboardButton(text="⭐ Referral stars sozla",  callback_data="admin_set_referral")],
-        [InlineKeyboardButton(text="⭐ Obuna stars sozla",     callback_data="admin_set_subscribe")],
-        [InlineKeyboardButton(text="💰 Balans qo'shish",       callback_data="admin_add_balance")],
-        [InlineKeyboardButton(text="💸 Balans ayirish",        callback_data="admin_deduct_balance")],
-        [InlineKeyboardButton(text="📊 Statistika",            callback_data="admin_stats")],
-        [InlineKeyboardButton(text="📣 Xabar yuborish",        callback_data="admin_broadcast")],
-        [InlineKeyboardButton(text="👥 Foydalanuvchilar",      callback_data="admin_users")],
-        [InlineKeyboardButton(text="🔙 Ortga",                 callback_data="back_main")],
+        [InlineKeyboardButton(text="➕ Kanal qo'shish",       callback_data="admin_add_channel")],
+        [InlineKeyboardButton(text="➖ Kanal o'chirish",      callback_data="admin_remove_channel")],
+        [InlineKeyboardButton(text="⭐ Referral stars sozla", callback_data="admin_set_referral")],
+        [InlineKeyboardButton(text="⭐ Obuna stars sozla",    callback_data="admin_set_subscribe")],
+        [InlineKeyboardButton(text="💰 Balans qo'shish",      callback_data="admin_add_balance")],
+        [InlineKeyboardButton(text="💸 Balans ayirish",       callback_data="admin_deduct_balance")],
+        [InlineKeyboardButton(text="📦 Buyurtmalar",          callback_data="admin_orders")],
+        [InlineKeyboardButton(text="📊 Statistika",           callback_data="admin_stats")],
+        [InlineKeyboardButton(text="📣 Xabar yuborish",       callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="👥 Foydalanuvchilar",     callback_data="admin_users")],
+        [InlineKeyboardButton(text="🔙 Ortga",                callback_data="back_main")],
     ])
 
 
@@ -352,18 +407,36 @@ async def cmd_start(message: Message, state: FSMContext):
         f"📌 <b>Qanday ishlaydi?</b>\n"
         f"• Do'stingizni taklif qiling → <b>+{ref_stars}⭐</b>\n"
         f"• Kanallarga obuna bo'ling → <b>+{sub_stars}⭐</b>\n"
-        f"• Stars to'plab 🎁 Gift sotib oling!\n\n"
+        f"• Stars to'plab 🎁 Gift oling!\n\n"
+        f"⏰ <b>Muhim:</b> Gift olish faqat <b>har kuni soat 20:00 — 00:00</b> da ishlaydi!\n\n"
         f"Quyidagi menyu orqali boshqaring 👇",
         reply_markup=main_menu(user_id),
         parse_mode="HTML"
     )
 
 
+@router.callback_query(F.data == "work_hours")
+async def work_hours_info(call: CallbackQuery):
+    now = datetime.now(TIMEZONE)
+    if is_working_hours():
+        status = "🟢 <b>Hozir ish vaqti!</b> Gift buyurtma bera olasiz."
+    else:
+        status = "🔴 <b>Hozir ish vaqti emas.</b>\nSoat 20:00 dan keyin keling!"
+    await call.message.edit_text(
+        f"⏰ <b>Ish vaqti: 20:00 — 00:00</b>\n\n"
+        f"{status}\n\n"
+        f"🕐 Hozirgi vaqt: <b>{now.strftime('%H:%M')}</b>",
+        reply_markup=back_kb(),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
 @router.callback_query(F.data == "balance")
 async def show_balance(call: CallbackQuery):
-    user_id = call.from_user.id
-    balance = get_balance(user_id)
-    user    = get_user(user_id)
+    user_id   = call.from_user.id
+    balance   = get_balance(user_id)
+    user      = get_user(user_id)
     ref_count = user[5] if user else 0
     bot_info  = await bot.get_me()
     ref_link  = f"https://t.me/{bot_info.username}?start={user_id}"
@@ -478,13 +551,25 @@ async def check_sub(call: CallbackQuery):
 
 @router.callback_query(F.data == "buy_gift")
 async def buy_gift_menu(call: CallbackQuery):
+    # Ish vaqtini tekshirish
+    if not is_working_hours():
+        now = datetime.now(TIMEZONE)
+        await call.answer(
+            f"⏰ Gift olish faqat soat 20:00 — 00:00 da!\n"
+            f"Hozirgi vaqt: {now.strftime('%H:%M')}\n"
+            f"Kechqurun keling! 🌙",
+            show_alert=True
+        )
+        return
+
     user_id = call.from_user.id
     balance = get_balance(user_id)
     await call.message.edit_text(
-        f"🎁 <b>Gift sotib olish</b>\n\n"
+        f"🎁 <b>Gift olish</b>\n\n"
         f"💰 Balans: <b>{balance}⭐</b>\n\n"
         f"✅ = Sotib olish mumkin\n"
         f"❌ = Stars yetarli emas\n\n"
+        f"⏰ Buyurtma qabul: <b>20:00 — 00:00</b>\n\n"
         f"Qaysi giftni xohlaysiz? 👇",
         reply_markup=gifts_keyboard(balance),
         parse_mode="HTML"
@@ -494,6 +579,10 @@ async def buy_gift_menu(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("buyg_"))
 async def select_gift(call: CallbackQuery):
+    if not is_working_hours():
+        await call.answer("⏰ Faqat soat 20:00 — 00:00 da buyurtma bera olasiz!", show_alert=True)
+        return
+
     user_id = call.from_user.id
     idx     = int(call.data.split("_")[1])
     if idx >= len(GIFTS):
@@ -511,11 +600,11 @@ async def select_gift(call: CallbackQuery):
         f"🎁 <b>{gift['emoji']} {gift['name']}</b>\n\n"
         f"💰 Narxi: <b>{gift['stars']}⭐</b>\n"
         f"💳 Balansingiz: <b>{balance}⭐</b>\n\n"
-        f"Sotib olishni tasdiqlaysizmi?",
+        f"Buyurtma berasizmi?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Ha, olaman!", callback_data=f"confirmg_{idx}"),
-                InlineKeyboardButton(text="❌ Yo'q",        callback_data="buy_gift")
+                InlineKeyboardButton(text="✅ Ha, buyurtma beraman!", callback_data=f"confirmg_{idx}"),
+                InlineKeyboardButton(text="❌ Yo'q", callback_data="buy_gift")
             ]
         ]),
         parse_mode="HTML"
@@ -525,41 +614,96 @@ async def select_gift(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("confirmg_"))
 async def confirm_gift(call: CallbackQuery):
-    user_id = call.from_user.id
-    idx     = int(call.data.split("_")[1])
+    if not is_working_hours():
+        await call.answer("⏰ Faqat soat 20:00 — 00:00 da buyurtma bera olasiz!", show_alert=True)
+        return
+
+    user_id   = call.from_user.id
+    idx       = int(call.data.split("_")[1])
     if idx >= len(GIFTS):
         await call.answer("Gift topilmadi!", show_alert=True)
         return
-    gift    = GIFTS[idx]
-    balance = get_balance(user_id)
+    gift      = GIFTS[idx]
+    balance   = get_balance(user_id)
     if balance < gift["stars"]:
         await call.answer("❌ Stars yetarli emas!", show_alert=True)
         return
-    deduct_balance(user_id, gift["stars"], f"Gift: {gift['name']}")
+
+    user      = get_user(user_id)
+    username  = user[1] or ""
+    full_name = user[2] or ""
+    uname_display = f"@{username}" if username else full_name
+
+    # Balansdan ayirish
+    deduct_balance(user_id, gift["stars"], f"Gift buyurtma: {gift['name']}")
+
+    # Buyurtmani saqlash
+    order_id = add_order(user_id, username, full_name, gift["name"], gift["emoji"], gift["stars"])
+
+    # Adminga xabar yuborish
     try:
-        await bot.send_gift(user_id=user_id, gift_id=gift["id"])
-        new_balance = get_balance(user_id)
-        await call.message.edit_text(
-            f"🎉 <b>Tabriklaymiz!</b>\n\n"
-            f"{gift['emoji']} <b>{gift['name']}</b> giftingiz yuborildi!\n\n"
-            f"💰 Qolgan balans: <b>{new_balance}⭐</b>",
+        await bot.send_message(
+            ADMIN_ID,
+            f"🔔 <b>Yangi gift buyurtma!</b>\n\n"
+            f"🆔 Buyurtma #{order_id}\n"
+            f"👤 Foydalanuvchi: {uname_display}\n"
+            f"🪪 ID: <code>{user_id}</code>\n"
+            f"🎁 Gift: {gift['emoji']} {gift['name']}\n"
+            f"⭐ Miqdor: {gift['stars']} stars\n"
+            f"🕐 Vaqt: {datetime.now(TIMEZONE).strftime('%H:%M')}\n\n"
+            f"✅ Giftni yuborish uchun {uname_display} ga {gift['stars']} ta stars gifti yuboring!",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="back_main")]
+                [InlineKeyboardButton(
+                    text="✅ Bajarildi",
+                    callback_data=f"done_order_{order_id}_{user_id}"
+                )]
             ]),
             parse_mode="HTML"
         )
     except Exception as e:
-        add_balance(user_id, gift["stars"], "Gift xatoligi - qaytarildi")
-        await call.message.edit_text(
-            "⚠️ <b>Gift yuborishda xatolik!</b>\n\nStars qaytarildi. Admin bilan bog'laning.",
-            reply_markup=back_kb(),
+        logger.error(f"Admin xabar yuborishda xato: {e}")
+
+    new_balance = get_balance(user_id)
+    await call.message.edit_text(
+        f"✅ <b>Buyurtmangiz qabul qilindi!</b>\n\n"
+        f"🎁 {gift['emoji']} <b>{gift['name']}</b>\n"
+        f"⭐ {gift['stars']} stars\n\n"
+        f"⏳ Admin soat <b>20:00 — 00:00</b> oralig'ida sizga gift yuboradi.\n\n"
+        f"💰 Qolgan balans: <b>{new_balance}⭐</b>",
+        reply_markup=back_kb(),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+# Admin buyurtmani bajarildiga belgilash
+@router.callback_query(F.data.startswith("done_order_"))
+async def done_order(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    parts    = call.data.split("_")
+    order_id = int(parts[2])
+    user_id  = int(parts[3])
+
+    complete_order(order_id)
+
+    # Foydalanuvchiga xabar
+    try:
+        await bot.send_message(
+            user_id,
+            f"🎉 <b>Giftingiz yuborildi!</b>\n\n"
+            f"Admin tomonidan sizga gift yuborildi.\n"
+            f"Tekshiring! ✅",
             parse_mode="HTML"
         )
-        await bot.send_message(
-            ADMIN_ID,
-            f"⚠️ Gift xatoligi!\nUser: {user_id}\nGift: {gift['id']}\nXato: {e}"
-        )
-    await call.answer()
+    except Exception:
+        pass
+
+    await call.message.edit_text(
+        call.message.text + "\n\n✅ <b>BAJARILDI</b>",
+        parse_mode="HTML"
+    )
+    await call.answer("✅ Buyurtma bajarildi deb belgilandi!")
 
 
 @router.callback_query(F.data == "back_main")
@@ -574,7 +718,8 @@ async def back_main(call: CallbackQuery, state: FSMContext):
         f"💰 Balansingiz: <b>{balance}⭐</b>\n\n"
         f"• Do'st taklif → <b>+{ref_stars}⭐</b>\n"
         f"• Kanal obuna → <b>+{sub_stars}⭐</b>\n"
-        f"• Stars to'pla → 🎁 Gift ol!",
+        f"• Stars to'pla → 🎁 Gift ol!\n\n"
+        f"⏰ Gift olish vaqti: <b>20:00 — 00:00</b>",
         reply_markup=main_menu(user_id),
         parse_mode="HTML"
     )
@@ -589,6 +734,28 @@ async def admin_panel(call: CallbackQuery):
         await call.answer("❌ Ruxsat yo'q!", show_alert=True)
         return
     await call.message.edit_text("🔧 <b>Admin Panel</b>", reply_markup=admin_keyboard(), parse_mode="HTML")
+    await call.answer()
+
+
+@router.callback_query(F.data == "admin_orders")
+async def admin_orders(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    orders = get_pending_orders()
+    if not orders:
+        await call.answer("Kutayotgan buyurtmalar yo'q!", show_alert=True)
+        return
+    text = "📦 <b>Kutayotgan buyurtmalar:</b>\n\n"
+    buttons = []
+    for o in orders:
+        uname = f"@{o[2]}" if o[2] else o[3]
+        text += f"#{o[0]} — {uname} — {o[5]} {o[4]} ({o[6]}⭐)\n"
+        buttons.append([InlineKeyboardButton(
+            text=f"✅ #{o[0]} — {uname} — {o[5]} {o[6]}⭐",
+            callback_data=f"done_order_{o[0]}_{o[1]}"
+        )])
+    buttons.append([InlineKeyboardButton(text="🔙 Ortga", callback_data="admin_panel")])
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
     await call.answer()
 
 
@@ -801,21 +968,22 @@ async def admin_stats(call: CallbackQuery):
     total_users, total_balance = get_stats()
     ref_stars = get_setting("referral_stars")
     sub_stars = get_setting("subscribe_stars")
-
     conn = db()
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM transactions WHERE type='credit'")
     total_credits = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM transactions WHERE description LIKE 'Gift%'")
+    c.execute("SELECT COUNT(*) FROM orders WHERE status='done'")
     total_gifts = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM orders WHERE status='pending'")
+    pending_gifts = c.fetchone()[0]
     conn.close()
-
     await call.message.edit_text(
         f"📊 <b>Statistika</b>\n\n"
         f"👥 Jami foydalanuvchilar: <b>{total_users}</b>\n"
         f"💰 Jami balanslar: <b>{total_balance}⭐</b>\n"
         f"📈 Jami kreditlar: <b>{total_credits}</b>\n"
-        f"🎁 Sotilgan giftlar: <b>{total_gifts}</b>\n\n"
+        f"🎁 Bajarilgan buyurtmalar: <b>{total_gifts}</b>\n"
+        f"⏳ Kutayotgan buyurtmalar: <b>{pending_gifts}</b>\n\n"
         f"⚙️ Sozlamalar:\n"
         f"• Referral: <b>{ref_stars}⭐</b>\n"
         f"• Obuna: <b>{sub_stars}⭐</b>",
@@ -869,7 +1037,7 @@ async def process_broadcast(message: Message, state: FSMContext):
         try:
             await bot.send_message(uid, f"📣 {message.text}", parse_mode="HTML")
             sent += 1
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.3)  # Spam bo'lmasin uchun
         except Exception:
             failed += 1
     await message.answer(
@@ -883,7 +1051,6 @@ async def main():
     init_db()
     dp.include_router(router)
 
-    # Render uchun health-check web server
     async def health(request):
         return web.Response(text="OK")
 
@@ -895,7 +1062,6 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     logger.info(f"✅ Web server port {port} da ishga tushdi!")
-
     logger.info("✅ Bot ishga tushdi!")
     await dp.start_polling(bot, skip_updates=True)
 
