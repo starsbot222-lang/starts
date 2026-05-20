@@ -3,6 +3,7 @@ import logging
 import os
 import sqlite3
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart
 from aiogram.types import (
@@ -868,7 +869,7 @@ async def process_broadcast(message: Message, state: FSMContext):
         try:
             await bot.send_message(uid, f"📣 {message.text}", parse_mode="HTML")
             sent += 1
-            await asyncio.sleep(0.05)  # flood limitdan qochish
+            await asyncio.sleep(0.05)
         except Exception:
             failed += 1
     await message.answer(
@@ -881,6 +882,20 @@ async def process_broadcast(message: Message, state: FSMContext):
 async def main():
     init_db()
     dp.include_router(router)
+
+    # Render uchun health-check web server
+    async def health(request):
+        return web.Response(text="OK")
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"✅ Web server port {port} da ishga tushdi!")
+
     logger.info("✅ Bot ishga tushdi!")
     await dp.start_polling(bot, skip_updates=True)
 
