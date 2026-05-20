@@ -556,7 +556,10 @@ async def check_sub(call: CallbackQuery):
             error_chs.append(channel_name)
             continue
 
-        bonus_doc = await channel_bonus.find_one({"user_id": user_id, "channel_id": channel_id_str})
+        bonus_doc = await channel_bonus.find_one({
+            "user_id": user_id,
+            "channel_id": channel_id_str
+        })
 
         if is_member and not bonus_doc:
             await channel_bonus.insert_one({
@@ -568,14 +571,26 @@ async def check_sub(call: CallbackQuery):
             earned += sub_stars
 
         elif not is_member and bonus_doc:
-            given = bonus_doc.get("stars_given", sub_stars)
-            await channel_bonus.delete_one({"user_id": user_id, "channel_id": channel_id_str})
-            user_doc = await users.find_one({"user_id": user_id})
-            cur_bal  = user_doc.get("balance", 0) if user_doc else 0
-            deduct   = min(given, cur_bal)
-            if deduct > 0:
-                await deduct_balance(user_id, deduct, f"Kanal tark etildi: {channel_name}")
-            lost += given
+            given = float(bonus_doc.get("stars_given", sub_stars))
+            await channel_bonus.delete_one({
+                "user_id": user_id,
+                "channel_id": channel_id_str
+            })
+            current_balance = await get_balance(user_id)
+            deduct_amount = min(given, current_balance)
+            if deduct_amount > 0:
+                await users.update_one(
+                    {"user_id": user_id},
+                    {"$inc": {"balance": -deduct_amount}}
+                )
+                await transactions.insert_one({
+                    "user_id": user_id,
+                    "amount": deduct_amount,
+                    "type": "debit",
+                    "description": f"Kanal tark etildi: {channel_name}",
+                    "created_at": datetime.utcnow()
+                })
+                lost += deduct_amount
 
     balance = await get_balance(user_id)
     parts   = []
@@ -584,35 +599,11 @@ async def check_sub(call: CallbackQuery):
     if lost > 0:
         parts.append(f"❌ -{round(lost,2)}⭐ qaytarildi (kanaldan chiqqansiz)")
     if error_chs:
-        parts.append(f"⚠️ Kanalda xatolik: {', '.join(error_chs)}")
+        parts.append(f"⚠️ Tekshirib bo'lmadi: {', '.join(error_chs)}")
     if not parts:
-        parts.append("ℹ️ Barcha kanallar uchun bonus allaqachon olingan.")
+        parts.append("ℹ️ O'zgarish yo'q.")
     parts.append(f"💰 Balans: {balance}⭐")
     await call.answer("\n".join(parts), show_alert=True)
-
-@router.callback_query(F.data == "support")
-async def support_menu(call: CallbackQuery):
-    user_id = call.from_user.id
-    allowed, minutes_left = await check_support_cooldown(user_id)
-    if not allowed:
-        await call.answer(
-            f"⏳ {minutes_left} daqiqadan keyin yuborishingiz mumkin.",
-            show_alert=True
-        )
-        return
-    await call.message.edit_text(
-        f"🆘 <b>Yordam / Muammo bildirish</b>\n\n"
-        f"1️⃣ Guruhga murojaat: {SUPPORT_GROUP}\n\n"
-        f"2️⃣ Yoki botga xabar yuboring (1 soatda 1 marta):",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💬 Guruhga o'tish", url=SUPPORT_GROUP)],
-            [InlineKeyboardButton(text="✏️ Xabar yozish", callback_data="support_write")],
-            [InlineKeyboardButton(text="🔙 Ortga", callback_data="back_main")],
-        ]),
-        parse_mode="HTML"
-    )
-    await call.answer()
-
 @router.callback_query(F.data == "support_write")
 async def support_write(call: CallbackQuery, state: FSMContext):
     user_id = call.from_user.id
