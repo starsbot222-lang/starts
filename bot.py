@@ -380,7 +380,6 @@ def main_menu(user_id):
             InlineKeyboardButton(text="👥 Referral",       callback_data="referral"),
         ],
         [InlineKeyboardButton(text="🎁 Gift olish",        callback_data="buy_gift")],
-        [InlineKeyboardButton(text="📢 Free Stars",        url="https://t.me/FreeStarssUz")],
         [InlineKeyboardButton(text="📢 Kanallarga obuna",  callback_data="channels")],
         [InlineKeyboardButton(text="📋 Transaksiyalar",    callback_data="transactions")],
         [InlineKeyboardButton(text="⏰ Ish vaqti",         callback_data="work_hours")],
