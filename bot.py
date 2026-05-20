@@ -1102,7 +1102,7 @@ async def process_broadcast(message: Message, state: FSMContext):
 async def auto_check_subscriptions():
     """Har 6 soatda barcha foydalanuvchilarni tekshiradi"""
     while True:
-        await asyncio.sleep(6 * 3600)  # 6 soat kutadi
+        await asyncio.sleep(2 * 3600)  # 6 soat kutadi
         logger.info("🔄 Avtomatik obuna tekshiruvi boshlandi...")
         
         chs = await get_channels()
