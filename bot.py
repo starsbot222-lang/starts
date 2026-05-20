@@ -584,7 +584,7 @@ async def check_sub(call: CallbackQuery):
     if lost > 0:
         parts.append(f"❌ -{round(lost,2)}⭐ qaytarildi (kanaldan chiqqansiz)")
     if error_chs:
-        parts.append(f"⚠️ Tekshirib bo'lmadi: {', '.join(error_chs)}")
+        parts.append(f"⚠️ Kanalda xatolik: {', '.join(error_chs)}")
     if not parts:
         parts.append("ℹ️ Barcha kanallar uchun bonus allaqachon olingan.")
     parts.append(f"💰 Balans: {balance}⭐")
@@ -846,7 +846,7 @@ async def admin_add_channel_start(call: CallbackQuery, state: FSMContext):
         "➕ <b>Kanal qo'shish</b>\n\n"
         "Public: <code>@kanalname</code> yoki <code>https://t.me/kanalname</code>\n"
         "Maxfiy: <code>-1001234567890</code>\n\n"
-        "⚠️ Bot kanalga <b>admin</b> bo'lishi shart!",
+        "⚠️ Kanalada hatolik<b></b> Qayta urining!",
         reply_markup=back_kb("admin_panel"), parse_mode="HTML"
     )
     await call.answer()
