@@ -111,7 +111,6 @@ def init_db():
             last_sent_at TIMESTAMP DEFAULT NULL
         )
     """)
-    # === YANGI: Har kanal uchun bonus jadvali ===
     c.execute("""
         CREATE TABLE IF NOT EXISTS user_channel_bonus (
             user_id     INTEGER,
@@ -367,8 +366,6 @@ class AdminStates(StatesGroup):
 class UserStates(StatesGroup):
     support_message = State()
 
-channel_temp = {}
-
 bot    = Bot(token=BOT_TOKEN)
 dp     = Dispatcher(storage=MemoryStorage())
 router = Router()
@@ -436,22 +433,21 @@ def back_kb(cb="back_main"):
         [InlineKeyboardButton(text="🔙 Ortga", callback_data=cb)]
     ])
 
-async def check_subscription(user_id):
-    channels = get_channels()
-    if not channels:
-        return True, []
-    not_subbed = []
-    for ch in channels:
-        try:
-            member = await bot.get_chat_member(ch[1], user_id)
-            if member.status in ["left", "kicked", "banned"]:
-                not_subbed.append(ch)
-        except Exception as e:
-            logger.warning(f"Kanal tekshirishda xato {ch[1]}: {e}")
-    return len(not_subbed) == 0, not_subbed
-
+# ===================== TO'G'IRLANGAN: resolve_channel =====================
+# Endi ham public (@username), ham private (-100...) ID larni qabul qiladi
 async def resolve_channel(link_or_username: str):
     raw = link_or_username.strip()
+
+    # Agar to'g'ridan-to'g'ri raqamli ID berilgan bo'lsa (masalan: -1001234567890)
+    if raw.lstrip("-").isdigit():
+        try:
+            chat = await bot.get_chat(int(raw))
+            return str(chat.id), chat.title or raw
+        except Exception as e:
+            logger.warning(f"Kanal ID bo'yicha topilmadi: {raw} — {e}")
+            return None, None
+
+    # Username yoki link bo'lsa
     if raw.startswith("https://t.me/"):
         username = "@" + raw.split("t.me/")[-1].split("/")[0]
     elif raw.startswith("t.me/"):
@@ -460,12 +456,138 @@ async def resolve_channel(link_or_username: str):
         username = raw
     else:
         username = "@" + raw
+
     try:
         chat = await bot.get_chat(username)
         return str(chat.id), chat.title or username
     except Exception as e:
         logger.warning(f"Kanal topilmadi: {username} — {e}")
         return None, None
+
+# ===================== TO'G'IRLANGAN: check_subscription =====================
+# Maxfiy kanallar uchun ham to'g'ri ishlaydi, xatolar log qilinadi
+async def check_subscription(user_id):
+    channels = get_channels()
+    if not channels:
+        return True, []
+    not_subbed = []
+    for ch in channels:
+        channel_id_str = ch[1]
+        try:
+            # channel_id raqam yoki string bo'lishi mumkin
+            try:
+                cid = int(channel_id_str)
+            except ValueError:
+                cid = channel_id_str
+
+            member = await bot.get_chat_member(cid, user_id)
+            if member.status in ["left", "kicked", "banned"]:
+                not_subbed.append(ch)
+        except Exception as e:
+            logger.warning(f"Kanal tekshirishda xato {channel_id_str}: {e}")
+            # Xato bo'lsa — obuna emasdek hisoblash (bot admin bo'lmasa ham)
+            not_subbed.append(ch)
+    return len(not_subbed) == 0, not_subbed
+
+# ===================== TO'G'IRLANGAN: check_sub =====================
+@router.callback_query(F.data == "check_sub")
+async def check_sub(call: CallbackQuery):
+    user_id = call.from_user.id
+    channels = get_channels()
+    if not channels:
+        await call.answer("Hozircha kanallar yo'q!", show_alert=True)
+        return
+
+    sub_stars = float(get_setting("subscribe_stars") or 0.10)
+    conn = db()
+    c = conn.cursor()
+
+    earned = 0.0
+    lost = 0.0
+    error_channels = []
+
+    for ch in channels:
+        channel_id_str = ch[1]
+        channel_name = ch[2]
+
+        try:
+            # channel_id int yoki string bo'lishi mumkin
+            try:
+                cid = int(channel_id_str)
+            except ValueError:
+                cid = channel_id_str
+
+            member = await bot.get_chat_member(cid, user_id)
+            is_member = member.status not in ["left", "kicked", "banned"]
+        except Exception as e:
+            logger.warning(f"Kanal tekshirishda xato {channel_id_str}: {e}")
+            error_channels.append(channel_name)
+            continue  # Bu kanalni o'tkazib yuborish (bonus ham, jarima ham yo'q)
+
+        c.execute(
+            "SELECT stars_given FROM user_channel_bonus WHERE user_id=? AND channel_id=?",
+            (user_id, channel_id_str)
+        )
+        row = c.fetchone()
+
+        if is_member and not row:
+            # Yangi obuna — bonus ber
+            c.execute(
+                "INSERT INTO user_channel_bonus (user_id, channel_id, stars_given) VALUES (?,?,?)",
+                (user_id, channel_id_str, sub_stars)
+            )
+            c.execute(
+                "UPDATE users SET balance = balance + ? WHERE user_id=?",
+                (sub_stars, user_id)
+            )
+            c.execute(
+                "INSERT INTO transactions (user_id, amount, type, description) VALUES (?,?,'credit',?)",
+                (user_id, sub_stars, f"Kanal obuna bonusi: {channel_name}")
+            )
+            earned += sub_stars
+
+        elif not is_member and row:
+            # Kanaldan chiqib ketgan — starsni qaytarib ol
+            given = row[0]
+            c.execute(
+                "DELETE FROM user_channel_bonus WHERE user_id=? AND channel_id=?",
+                (user_id, channel_id_str)
+            )
+            c.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+            bal_row = c.fetchone()
+            current_balance = bal_row[0] if bal_row else 0
+            deduct_amount = min(given, current_balance)
+            if deduct_amount > 0:
+                c.execute(
+                    "UPDATE users SET balance = balance - ? WHERE user_id=?",
+                    (deduct_amount, user_id)
+                )
+                c.execute(
+                    "INSERT INTO transactions (user_id, amount, type, description) VALUES (?,?,'debit',?)",
+                    (user_id, deduct_amount, f"Kanal tark etildi: {channel_name}")
+                )
+            lost += given
+
+    conn.commit()
+    conn.close()
+
+    balance = get_balance(user_id)
+
+    # Natija xabarini tuzish
+    msg_parts = []
+    if earned > 0:
+        msg_parts.append(f"✅ +{round(earned, 2)}⭐ qo'shildi!")
+    if lost > 0:
+        msg_parts.append(f"❌ -{round(lost, 2)}⭐ qaytarildi (kanaldan chiqqansiz)")
+    if error_channels:
+        names = ", ".join(error_channels)
+        msg_parts.append(f"⚠️ Tekshirib bo'lmadi: {names}\n(Bot admin bo'lishi kerak)")
+    if not msg_parts:
+        msg_parts.append("ℹ️ Barcha kanallar uchun bonus allaqachon olingan.")
+
+    msg_parts.append(f"💰 Balans: {balance}⭐")
+    await call.answer("\n".join(msg_parts), show_alert=True)
+
 
 # ===================== HANDLERS =====================
 
@@ -482,7 +604,6 @@ async def cmd_start(message: Message, state: FSMContext):
     if len(args) > 1:
         try:
             ref_id = int(args[1])
-            # Faqat yangi foydalanuvchi va botga avval kirmagan bo'lsa
             if ref_id != user_id and get_user(ref_id) and is_new:
                 referred_by = ref_id
         except Exception:
@@ -634,106 +755,6 @@ async def show_channels(call: CallbackQuery):
         reply_markup=channels_keyboard(), parse_mode="HTML"
     )
     await call.answer()
-
-# ===================== O'ZGARTIRILGAN: check_sub =====================
-@router.callback_query(F.data == "check_sub")
-async def check_sub(call: CallbackQuery):
-    user_id = call.from_user.id
-    channels = get_channels()
-    if not channels:
-        await call.answer("Hozircha kanallar yo'q!", show_alert=True)
-        return
-
-    sub_stars = float(get_setting("subscribe_stars") or 0.10)
-    conn = db()
-    c = conn.cursor()
-
-    earned = 0.0
-    lost = 0.0
-
-    for ch in channels:
-        channel_id = ch[1]
-        channel_name = ch[2]
-
-        try:
-            member = await bot.get_chat_member(channel_id, user_id)
-            is_member = member.status not in ["left", "kicked", "banned"]
-        except Exception as e:
-            logger.warning(f"Kanal tekshirishda xato {channel_id}: {e}")
-            continue
-
-        c.execute(
-            "SELECT stars_given FROM user_channel_bonus WHERE user_id=? AND channel_id=?",
-            (user_id, channel_id)
-        )
-        row = c.fetchone()
-
-        if is_member and not row:
-            # Yangi obuna — bonus ber
-            c.execute(
-                "INSERT INTO user_channel_bonus (user_id, channel_id, stars_given) VALUES (?,?,?)",
-                (user_id, channel_id, sub_stars)
-            )
-            c.execute(
-                "UPDATE users SET balance = balance + ? WHERE user_id=?",
-                (sub_stars, user_id)
-            )
-            c.execute(
-                "INSERT INTO transactions (user_id, amount, type, description) VALUES (?,?,'credit',?)",
-                (user_id, sub_stars, f"Kanal obuna bonusi: {channel_name}")
-            )
-            earned += sub_stars
-
-        elif not is_member and row:
-            # Kanaldan chiqib ketgan — starsni qaytarib ol
-            given = row[0]
-            c.execute(
-                "DELETE FROM user_channel_bonus WHERE user_id=? AND channel_id=?",
-                (user_id, channel_id)
-            )
-            c.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-            bal_row = c.fetchone()
-            current_balance = bal_row[0] if bal_row else 0
-            deduct_amount = min(given, current_balance)
-            if deduct_amount > 0:
-                c.execute(
-                    "UPDATE users SET balance = balance - ? WHERE user_id=?",
-                    (deduct_amount, user_id)
-                )
-                c.execute(
-                    "INSERT INTO transactions (user_id, amount, type, description) VALUES (?,?,'debit',?)",
-                    (user_id, deduct_amount, f"Kanal tark etildi: {channel_name}")
-                )
-            lost += given
-
-    conn.commit()
-    conn.close()
-
-    balance = get_balance(user_id)
-
-    if earned > 0 and lost > 0:
-        await call.answer(
-            f"✅ +{round(earned,2)}⭐ olindi\n"
-            f"❌ -{round(lost,2)}⭐ qaytarildi (kanaldan chiqqansiz)\n"
-            f"💰 Balans: {balance}⭐",
-            show_alert=True
-        )
-    elif earned > 0:
-        await call.answer(
-            f"🎉 +{round(earned,2)}⭐ qo'shildi!\n💰 Balans: {balance}⭐",
-            show_alert=True
-        )
-    elif lost > 0:
-        await call.answer(
-            f"❌ -{round(lost,2)}⭐ qaytarildi (kanaldan chiqqansiz)\n"
-            f"💰 Balans: {balance}⭐",
-            show_alert=True
-        )
-    else:
-        await call.answer(
-            f"ℹ️ Barcha kanallar uchun bonus allaqachon olingan.\n💰 Balans: {balance}⭐",
-            show_alert=True
-        )
 
 # ===================== YORDAM (SUPPORT) =====================
 
@@ -1042,7 +1063,8 @@ async def admin_orders(call: CallbackQuery):
     )
     await call.answer()
 
-# ===================== O'ZGARTIRILGAN: Kanal qo'shish (1 qadam) =====================
+# ===================== TO'G'IRLANGAN: Kanal qo'shish =====================
+# Maxfiy kanal uchun to'g'ridan-to'g'ri ID qabul qiladi
 @router.callback_query(F.data == "admin_add_channel")
 async def admin_add_channel_start(call: CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -1050,11 +1072,13 @@ async def admin_add_channel_start(call: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.add_channel_link)
     await call.message.edit_text(
         "➕ <b>Kanal qo'shish</b>\n\n"
-        "Kanal linkini yuboring — nom avtomatik olinadi:\n\n"
-        "📌 Misol:\n"
+        "Kanal linkini yoki ID sini yuboring:\n\n"
+        "📌 <b>Public kanal:</b>\n"
         "<code>https://t.me/kanalname</code>\n"
-        "yoki\n"
-        "<code>@kanalname</code>",
+        "<code>@kanalname</code>\n\n"
+        "🔒 <b>Maxfiy kanal:</b>\n"
+        "<code>-1001234567890</code>\n\n"
+        "⚠️ Bot kanalga <b>admin</b> sifatida qo'shilgan bo'lishi shart!",
         reply_markup=back_kb("admin_panel"),
         parse_mode="HTML"
     )
@@ -1069,12 +1093,17 @@ async def process_channel_link(message: Message, state: FSMContext):
     channel_id, auto_name = await resolve_channel(raw)
     if not channel_id:
         await message.answer(
-            "❌ Kanal topilmadi!\n\n"
-            "Bot kanalga admin sifatida qo'shilganmi?\n"
-            "Link to'g'rimi? Qayta tekshiring.",
-            reply_markup=back_kb("admin_panel")
+            "❌ <b>Kanal topilmadi!</b>\n\n"
+            "Tekshiring:\n"
+            "• Bot kanalga <b>admin</b> sifatida qo'shilganmi?\n"
+            "• Link yoki ID to'g'rimi?\n"
+            "• Maxfiy kanal uchun to'liq ID bering: <code>-1001234567890</code>",
+            reply_markup=back_kb("admin_panel"),
+            parse_mode="HTML"
         )
         return
+
+    # Link tuzish
     raw_lower = raw.lower()
     if raw_lower.startswith("https://t.me/"):
         link = raw
@@ -1082,10 +1111,16 @@ async def process_channel_link(message: Message, state: FSMContext):
         link = "https://" + raw
     elif raw_lower.startswith("@"):
         link = f"https://t.me/{raw[1:]}"
+    elif raw.lstrip("-").isdigit():
+        # Maxfiy kanal — public link yo'q, shuning uchun invite link olishga harakat
+        try:
+            invite = await bot.export_chat_invite_link(int(channel_id))
+            link = invite
+        except Exception:
+            link = f"https://t.me/c/{channel_id.lstrip('-100')}"
     else:
         link = f"https://t.me/{raw}"
 
-    # Nomni avtomatik olib, darhol saqlaymiz
     add_channel(channel_id, auto_name, link)
     admin_log(ADMIN_ID, "add_channel", f"id={channel_id}, name={auto_name}")
     await state.clear()
