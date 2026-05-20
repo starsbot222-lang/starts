@@ -1,8 +1,10 @@
 import asyncio
 import logging
+import os
 import sqlite3
+
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 )
@@ -10,49 +12,64 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-BOT_TOKEN = "8910662045:AAEMfDVkTGcUlATtEFRTzF2tDoRzWQIRw3M"
-ADMIN_ID = 6102256074
+# ===================== SOZLAMALAR =====================
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "6102256074"))
+DB_PATH = "/tmp/bot.db"  # Render uchun /tmp ishlatamiz
+# ======================================================
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+# ===================== DATABASE =====================
 def db():
-    return sqlite3.connect("bot.db")
+    return sqlite3.connect(DB_PATH)
+
 
 def init_db():
     conn = db()
     c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        full_name TEXT,
-        balance REAL DEFAULT 0,
-        referred_by INTEGER DEFAULT NULL,
-        referral_count INTEGER DEFAULT 0,
-        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS channels (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        channel_id TEXT UNIQUE,
-        channel_name TEXT,
-        channel_link TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS transactions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        amount REAL,
-        type TEXT,
-        description TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )""")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id       INTEGER PRIMARY KEY,
+            username      TEXT,
+            full_name     TEXT,
+            balance       REAL DEFAULT 0,
+            referred_by   INTEGER DEFAULT NULL,
+            referral_count INTEGER DEFAULT 0,
+            joined_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS channels (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id   TEXT UNIQUE,
+            channel_name TEXT,
+            channel_link TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER,
+            amount      REAL,
+            type        TEXT,
+            description TEXT,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     c.execute("INSERT OR IGNORE INTO settings VALUES ('referral_stars', '0.25')")
     c.execute("INSERT OR IGNORE INTO settings VALUES ('subscribe_stars', '0.10')")
     conn.commit()
     conn.close()
+
 
 def get_setting(key):
     conn = db()
@@ -62,12 +79,14 @@ def get_setting(key):
     conn.close()
     return row[0] if row else None
 
+
 def set_setting(key, value):
     conn = db()
     c = conn.cursor()
     c.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, str(value)))
     conn.commit()
     conn.close()
+
 
 def get_user(user_id):
     conn = db()
@@ -77,31 +96,41 @@ def get_user(user_id):
     conn.close()
     return row
 
+
 def add_user(user_id, username, full_name, referred_by=None):
     conn = db()
     c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO users (user_id, username, full_name, referred_by) VALUES (?,?,?,?)",
-              (user_id, username, full_name, referred_by))
+    c.execute(
+        "INSERT OR IGNORE INTO users (user_id, username, full_name, referred_by) VALUES (?,?,?,?)",
+        (user_id, username, full_name, referred_by)
+    )
     conn.commit()
     conn.close()
+
 
 def add_balance(user_id, amount, desc=""):
     conn = db()
     c = conn.cursor()
     c.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user_id))
-    c.execute("INSERT INTO transactions (user_id, amount, type, description) VALUES (?,?,?,?)",
-              (user_id, amount, "credit", desc))
+    c.execute(
+        "INSERT INTO transactions (user_id, amount, type, description) VALUES (?,?,?,?)",
+        (user_id, amount, "credit", desc)
+    )
     conn.commit()
     conn.close()
+
 
 def deduct_balance(user_id, amount, desc=""):
     conn = db()
     c = conn.cursor()
     c.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (amount, user_id))
-    c.execute("INSERT INTO transactions (user_id, amount, type, description) VALUES (?,?,?,?)",
-              (user_id, amount, "debit", desc))
+    c.execute(
+        "INSERT INTO transactions (user_id, amount, type, description) VALUES (?,?,?,?)",
+        (user_id, amount, "debit", desc)
+    )
     conn.commit()
     conn.close()
+
 
 def get_balance(user_id):
     conn = db()
@@ -111,6 +140,7 @@ def get_balance(user_id):
     conn.close()
     return round(row[0], 2) if row else 0
 
+
 def get_channels():
     conn = db()
     c = conn.cursor()
@@ -119,13 +149,17 @@ def get_channels():
     conn.close()
     return rows
 
+
 def add_channel(channel_id, name, link):
     conn = db()
     c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO channels (channel_id, channel_name, channel_link) VALUES (?,?,?)",
-              (channel_id, name, link))
+    c.execute(
+        "INSERT OR IGNORE INTO channels (channel_id, channel_name, channel_link) VALUES (?,?,?)",
+        (channel_id, name, link)
+    )
     conn.commit()
     conn.close()
+
 
 def remove_channel(channel_id):
     conn = db()
@@ -133,6 +167,7 @@ def remove_channel(channel_id):
     c.execute("DELETE FROM channels WHERE channel_id=?", (channel_id,))
     conn.commit()
     conn.close()
+
 
 def get_stats():
     conn = db()
@@ -144,6 +179,7 @@ def get_stats():
     conn.close()
     return total, round(total_balance, 2)
 
+
 def get_all_users():
     conn = db()
     c = conn.cursor()
@@ -152,50 +188,67 @@ def get_all_users():
     conn.close()
     return [r[0] for r in rows]
 
-class AdminStates(StatesGroup):
-    add_channel = State()
-    set_referral_stars = State()
-    set_subscribe_stars = State()
-    broadcast = State()
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-router = Router()
-
+# ===================== GIFTS =====================
 GIFTS = [
-    {"id": "TgGift15Stars1",  "emoji": "💝", "name": "Heart",    "stars": 15},
-    {"id": "TgGift15Stars2",  "emoji": "🧸", "name": "Bear",     "stars": 15},
-    {"id": "TgGift25Stars1",  "emoji": "🎁", "name": "Present",  "stars": 25},
-    {"id": "TgGift25Stars2",  "emoji": "🌹", "name": "Rose",     "stars": 25},
-    {"id": "TgGift50Stars1",  "emoji": "🎂", "name": "Cake",     "stars": 50},
-    {"id": "TgGift50Stars2",  "emoji": "💐", "name": "Bouquet",  "stars": 50},
-    {"id": "TgGift50Stars3",  "emoji": "🚀", "name": "Rocket",   "stars": 50},
-    {"id": "TgGift100Stars1", "emoji": "🏆", "name": "Trophy",   "stars": 100},
-    {"id": "TgGift100Stars2", "emoji": "💍", "name": "Ring",     "stars": 100},
-    {"id": "TgGift100Stars3", "emoji": "💎", "name": "Diamond",  "stars": 100},
+    {"id": "TgGift15Stars1",  "emoji": "💝", "name": "Heart",   "stars": 15},
+    {"id": "TgGift15Stars2",  "emoji": "🧸", "name": "Bear",    "stars": 15},
+    {"id": "TgGift25Stars1",  "emoji": "🎁", "name": "Present", "stars": 25},
+    {"id": "TgGift25Stars2",  "emoji": "🌹", "name": "Rose",    "stars": 25},
+    {"id": "TgGift50Stars1",  "emoji": "🎂", "name": "Cake",    "stars": 50},
+    {"id": "TgGift50Stars2",  "emoji": "💐", "name": "Bouquet", "stars": 50},
+    {"id": "TgGift50Stars3",  "emoji": "🚀", "name": "Rocket",  "stars": 50},
+    {"id": "TgGift100Stars1", "emoji": "🏆", "name": "Trophy",  "stars": 100},
+    {"id": "TgGift100Stars2", "emoji": "💍", "name": "Ring",    "stars": 100},
+    {"id": "TgGift100Stars3", "emoji": "💎", "name": "Diamond", "stars": 100},
 ]
 
+# ===================== STATES =====================
+class AdminStates(StatesGroup):
+    add_channel        = State()
+    set_referral_stars = State()
+    set_subscribe_stars = State()
+    broadcast          = State()
+    add_balance_input  = State()
+    deduct_balance_input = State()
+
+
+# ===================== BOT & ROUTER =====================
+bot = Bot(token=BOT_TOKEN)
+dp  = Dispatcher(storage=MemoryStorage())
+router = Router()
+
+
+# ===================== KEYBOARDS =====================
 def main_menu(user_id):
     buttons = [
-        [InlineKeyboardButton(text="⭐ Balansim", callback_data="balance"),
-         InlineKeyboardButton(text="👥 Referral", callback_data="referral")],
-        [InlineKeyboardButton(text="🎁 Gift sotib olish", callback_data="buy_gift")],
-        [InlineKeyboardButton(text="📢 Kanallarga obuna", callback_data="channels")],
+        [
+            InlineKeyboardButton(text="⭐ Balansim",          callback_data="balance"),
+            InlineKeyboardButton(text="👥 Referral",          callback_data="referral"),
+        ],
+        [InlineKeyboardButton(text="🎁 Gift sotib olish",     callback_data="buy_gift")],
+        [InlineKeyboardButton(text="📢 Kanallarga obuna",     callback_data="channels")],
+        [InlineKeyboardButton(text="📋 Transaksiyalar",       callback_data="transactions")],
     ]
     if user_id == ADMIN_ID:
         buttons.append([InlineKeyboardButton(text="🔧 Admin panel", callback_data="admin_panel")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+
 def admin_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Kanal qoshish", callback_data="admin_add_channel")],
-        [InlineKeyboardButton(text="➖ Kanal ochirish", callback_data="admin_remove_channel")],
-        [InlineKeyboardButton(text="⭐ Referral stars sozla", callback_data="admin_set_referral")],
-        [InlineKeyboardButton(text="⭐ Obuna stars sozla", callback_data="admin_set_subscribe")],
-        [InlineKeyboardButton(text="📊 Statistika", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="📣 Xabar yuborish", callback_data="admin_broadcast")],
-        [InlineKeyboardButton(text="🔙 Ortga", callback_data="back_main")],
+        [InlineKeyboardButton(text="➕ Kanal qo'shish",        callback_data="admin_add_channel")],
+        [InlineKeyboardButton(text="➖ Kanal o'chirish",       callback_data="admin_remove_channel")],
+        [InlineKeyboardButton(text="⭐ Referral stars sozla",  callback_data="admin_set_referral")],
+        [InlineKeyboardButton(text="⭐ Obuna stars sozla",     callback_data="admin_set_subscribe")],
+        [InlineKeyboardButton(text="💰 Balans qo'shish",       callback_data="admin_add_balance")],
+        [InlineKeyboardButton(text="💸 Balans ayirish",        callback_data="admin_deduct_balance")],
+        [InlineKeyboardButton(text="📊 Statistika",            callback_data="admin_stats")],
+        [InlineKeyboardButton(text="📣 Xabar yuborish",        callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="👥 Foydalanuvchilar",      callback_data="admin_users")],
+        [InlineKeyboardButton(text="🔙 Ortga",                 callback_data="back_main")],
     ])
+
 
 def gifts_keyboard(user_balance):
     buttons = []
@@ -215,6 +268,7 @@ def gifts_keyboard(user_balance):
     buttons.append([InlineKeyboardButton(text="🔙 Ortga", callback_data="back_main")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+
 def channels_keyboard():
     channels = get_channels()
     buttons = []
@@ -224,6 +278,14 @@ def channels_keyboard():
     buttons.append([InlineKeyboardButton(text="🔙 Ortga", callback_data="back_main")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+
+def back_kb(cb="back_main"):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Ortga", callback_data=cb)]
+    ])
+
+
+# ===================== HELPERS =====================
 async def check_subscription(user_id):
     channels = get_channels()
     if not channels:
@@ -238,22 +300,25 @@ async def check_subscription(user_id):
             logger.warning(f"Kanal tekshirishda xato {ch[1]}: {e}")
     return len(not_subbed) == 0, not_subbed
 
+
+# ===================== HANDLERS =====================
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    user_id = message.from_user.id
-    username = message.from_user.username or ""
+    user_id   = message.from_user.id
+    username  = message.from_user.username or ""
     full_name = message.from_user.full_name or ""
-    args = message.text.split()
+    args      = message.text.split()
     referred_by = None
-    is_new = get_user(user_id) is None
+    is_new    = get_user(user_id) is None
 
     if len(args) > 1:
         try:
             ref_id = int(args[1])
             if ref_id != user_id and get_user(ref_id):
                 referred_by = ref_id
-        except:
+        except Exception:
             pass
 
     add_user(user_id, username, full_name, referred_by)
@@ -273,10 +338,10 @@ async def cmd_start(message: Message, state: FSMContext):
                 f"➕ Hisobingizga <b>+{ref_stars}⭐</b> qo'shildi!",
                 parse_mode="HTML"
             )
-        except:
+        except Exception:
             pass
 
-    balance = get_balance(user_id)
+    balance   = get_balance(user_id)
     ref_stars = get_setting("referral_stars") or "0.25"
     sub_stars = get_setting("subscribe_stars") or "0.10"
 
@@ -292,34 +357,34 @@ async def cmd_start(message: Message, state: FSMContext):
         parse_mode="HTML"
     )
 
+
 @router.callback_query(F.data == "balance")
 async def show_balance(call: CallbackQuery):
     user_id = call.from_user.id
     balance = get_balance(user_id)
-    user = get_user(user_id)
+    user    = get_user(user_id)
     ref_count = user[5] if user else 0
-    bot_info = await bot.get_me()
-    ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
+    bot_info  = await bot.get_me()
+    ref_link  = f"https://t.me/{bot_info.username}?start={user_id}"
     await call.message.edit_text(
         f"💰 <b>Balansingiz: {balance}⭐</b>\n\n"
         f"👥 Taklif qilganlar: <b>{ref_count} kishi</b>\n\n"
         f"🔗 Referral linkingiz:\n<code>{ref_link}</code>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Ortga", callback_data="back_main")]
-        ]),
+        reply_markup=back_kb(),
         parse_mode="HTML"
     )
     await call.answer()
 
+
 @router.callback_query(F.data == "referral")
 async def show_referral(call: CallbackQuery):
-    user_id = call.from_user.id
-    user = get_user(user_id)
+    user_id   = call.from_user.id
+    user      = get_user(user_id)
     ref_count = user[5] if user else 0
     ref_stars = get_setting("referral_stars") or "0.25"
-    balance = get_balance(user_id)
-    bot_info = await bot.get_me()
-    ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
+    balance   = get_balance(user_id)
+    bot_info  = await bot.get_me()
+    ref_link  = f"https://t.me/{bot_info.username}?start={user_id}"
     await call.message.edit_text(
         f"👥 <b>Referral tizimi</b>\n\n"
         f"🔗 Sizning linkingiz:\n<code>{ref_link}</code>\n\n"
@@ -337,9 +402,33 @@ async def show_referral(call: CallbackQuery):
     )
     await call.answer()
 
+
+@router.callback_query(F.data == "transactions")
+async def show_transactions(call: CallbackQuery):
+    user_id = call.from_user.id
+    conn = db()
+    c = conn.cursor()
+    c.execute(
+        "SELECT amount, type, description, created_at FROM transactions "
+        "WHERE user_id=? ORDER BY created_at DESC LIMIT 10",
+        (user_id,)
+    )
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        await call.answer("Hozircha transaksiyalar yo'q!", show_alert=True)
+        return
+    text = "📋 <b>So'nggi 10 ta transaksiya:</b>\n\n"
+    for r in rows:
+        sign = "➕" if r[1] == "credit" else "➖"
+        text += f"{sign} <b>{r[0]}⭐</b> — {r[2]}\n<i>{r[3]}</i>\n\n"
+    await call.message.edit_text(text, reply_markup=back_kb(), parse_mode="HTML")
+    await call.answer()
+
+
 @router.callback_query(F.data == "channels")
 async def show_channels(call: CallbackQuery):
-    channels = get_channels()
+    channels  = get_channels()
     if not channels:
         await call.answer("Hozircha kanallar yo'q!", show_alert=True)
         return
@@ -352,6 +441,7 @@ async def show_channels(call: CallbackQuery):
         parse_mode="HTML"
     )
     await call.answer()
+
 
 @router.callback_query(F.data == "check_sub")
 async def check_sub(call: CallbackQuery):
@@ -370,17 +460,20 @@ async def check_sub(call: CallbackQuery):
         await call.answer("✅ Siz allaqachon obuna bonusini oldingiz!", show_alert=True)
         return
     sub_stars = float(get_setting("subscribe_stars") or 0.10)
-    channels = get_channels()
-    total = round(sub_stars * len(channels), 2)
+    channels  = get_channels()
+    total     = round(sub_stars * len(channels), 2)
     conn = db()
     c = conn.cursor()
     c.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (total, user_id))
-    c.execute("INSERT INTO transactions (user_id, amount, type, description) VALUES (?,?,'subscribe','Obuna bonusi')",
-              (user_id, total))
+    c.execute(
+        "INSERT INTO transactions (user_id, amount, type, description) VALUES (?,?,'subscribe','Obuna bonusi')",
+        (user_id, total)
+    )
     conn.commit()
     conn.close()
     balance = get_balance(user_id)
     await call.answer(f"🎉 +{total}⭐ qo'shildi! Balans: {balance}⭐", show_alert=True)
+
 
 @router.callback_query(F.data == "buy_gift")
 async def buy_gift_menu(call: CallbackQuery):
@@ -397,14 +490,15 @@ async def buy_gift_menu(call: CallbackQuery):
     )
     await call.answer()
 
+
 @router.callback_query(F.data.startswith("buyg_"))
 async def select_gift(call: CallbackQuery):
     user_id = call.from_user.id
-    idx = int(call.data.split("_")[1])
+    idx     = int(call.data.split("_")[1])
     if idx >= len(GIFTS):
         await call.answer("Gift topilmadi!", show_alert=True)
         return
-    gift = GIFTS[idx]
+    gift    = GIFTS[idx]
     balance = get_balance(user_id)
     if balance < gift["stars"]:
         await call.answer(
@@ -420,21 +514,22 @@ async def select_gift(call: CallbackQuery):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="✅ Ha, olaman!", callback_data=f"confirmg_{idx}"),
-                InlineKeyboardButton(text="❌ Yo'q", callback_data="buy_gift")
+                InlineKeyboardButton(text="❌ Yo'q",        callback_data="buy_gift")
             ]
         ]),
         parse_mode="HTML"
     )
     await call.answer()
 
+
 @router.callback_query(F.data.startswith("confirmg_"))
 async def confirm_gift(call: CallbackQuery):
     user_id = call.from_user.id
-    idx = int(call.data.split("_")[1])
+    idx     = int(call.data.split("_")[1])
     if idx >= len(GIFTS):
         await call.answer("Gift topilmadi!", show_alert=True)
         return
-    gift = GIFTS[idx]
+    gift    = GIFTS[idx]
     balance = get_balance(user_id)
     if balance < gift["stars"]:
         await call.answer("❌ Stars yetarli emas!", show_alert=True)
@@ -455,20 +550,22 @@ async def confirm_gift(call: CallbackQuery):
     except Exception as e:
         add_balance(user_id, gift["stars"], "Gift xatoligi - qaytarildi")
         await call.message.edit_text(
-            f"⚠️ <b>Gift yuborishda xatolik!</b>\n\nStars qaytarildi. Admin bilan bog'laning.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 Ortga", callback_data="back_main")]
-            ]),
+            "⚠️ <b>Gift yuborishda xatolik!</b>\n\nStars qaytarildi. Admin bilan bog'laning.",
+            reply_markup=back_kb(),
             parse_mode="HTML"
         )
-        await bot.send_message(ADMIN_ID, f"⚠️ Gift xatoligi!\nUser: {user_id}\nGift: {gift['id']}\nXato: {e}")
+        await bot.send_message(
+            ADMIN_ID,
+            f"⚠️ Gift xatoligi!\nUser: {user_id}\nGift: {gift['id']}\nXato: {e}"
+        )
     await call.answer()
+
 
 @router.callback_query(F.data == "back_main")
 async def back_main(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    user_id = call.from_user.id
-    balance = get_balance(user_id)
+    user_id   = call.from_user.id
+    balance   = get_balance(user_id)
     ref_stars = get_setting("referral_stars") or "0.25"
     sub_stars = get_setting("subscribe_stars") or "0.10"
     await call.message.edit_text(
@@ -482,7 +579,9 @@ async def back_main(call: CallbackQuery, state: FSMContext):
     )
     await call.answer()
 
-# ===== ADMIN =====
+
+# ===================== ADMIN HANDLERS =====================
+
 @router.callback_query(F.data == "admin_panel")
 async def admin_panel(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
@@ -490,6 +589,7 @@ async def admin_panel(call: CallbackQuery):
         return
     await call.message.edit_text("🔧 <b>Admin Panel</b>", reply_markup=admin_keyboard(), parse_mode="HTML")
     await call.answer()
+
 
 @router.callback_query(F.data == "admin_add_channel")
 async def admin_add_channel(call: CallbackQuery, state: FSMContext):
@@ -500,12 +600,11 @@ async def admin_add_channel(call: CallbackQuery, state: FSMContext):
         "➕ <b>Kanal qo'shish</b>\n\n"
         "Quyidagi formatda yuboring:\n"
         "<code>@username | Kanal nomi | https://t.me/username</code>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Bekor", callback_data="admin_panel")]
-        ]),
+        reply_markup=back_kb("admin_panel"),
         parse_mode="HTML"
     )
     await call.answer()
+
 
 @router.message(AdminStates.add_channel)
 async def process_add_channel(message: Message, state: FSMContext):
@@ -523,6 +622,7 @@ async def process_add_channel(message: Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"❌ Xatolik: {e}")
 
+
 @router.callback_query(F.data == "admin_remove_channel")
 async def admin_remove_channel(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
@@ -533,9 +633,13 @@ async def admin_remove_channel(call: CallbackQuery):
         return
     buttons = [[InlineKeyboardButton(text=f"🗑 {ch[2]}", callback_data=f"delch_{ch[1]}")] for ch in channels]
     buttons.append([InlineKeyboardButton(text="🔙 Ortga", callback_data="admin_panel")])
-    await call.message.edit_text("➖ <b>Qaysi kanalni o'chirish?</b>",
-                                  reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    await call.message.edit_text(
+        "➖ <b>Qaysi kanalni o'chirish?</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
+    )
     await call.answer()
+
 
 @router.callback_query(F.data.startswith("delch_"))
 async def delete_channel(call: CallbackQuery):
@@ -552,6 +656,7 @@ async def delete_channel(call: CallbackQuery):
     buttons.append([InlineKeyboardButton(text="🔙 Ortga", callback_data="admin_panel")])
     await call.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
+
 @router.callback_query(F.data == "admin_set_referral")
 async def admin_set_referral(call: CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -560,12 +665,11 @@ async def admin_set_referral(call: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.set_referral_stars)
     await call.message.edit_text(
         f"⭐ <b>Referral stars miqdori</b>\n\nHozirgi: <b>{current}⭐</b>\n\nYangi miqdor kiriting:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Bekor", callback_data="admin_panel")]
-        ]),
+        reply_markup=back_kb("admin_panel"),
         parse_mode="HTML"
     )
     await call.answer()
+
 
 @router.message(AdminStates.set_referral_stars)
 async def process_referral_stars(message: Message, state: FSMContext):
@@ -576,8 +680,9 @@ async def process_referral_stars(message: Message, state: FSMContext):
         set_setting("referral_stars", val)
         await state.clear()
         await message.answer(f"✅ Referral stars: <b>{val}⭐</b>", reply_markup=admin_keyboard(), parse_mode="HTML")
-    except:
+    except Exception:
         await message.answer("❌ Raqam kiriting! Masalan: 0.25")
+
 
 @router.callback_query(F.data == "admin_set_subscribe")
 async def admin_set_subscribe(call: CallbackQuery, state: FSMContext):
@@ -587,12 +692,11 @@ async def admin_set_subscribe(call: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.set_subscribe_stars)
     await call.message.edit_text(
         f"⭐ <b>Obuna stars miqdori</b>\n\nHozirgi: <b>{current}⭐</b>\n\nYangi miqdor kiriting:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Bekor", callback_data="admin_panel")]
-        ]),
+        reply_markup=back_kb("admin_panel"),
         parse_mode="HTML"
     )
     await call.answer()
+
 
 @router.message(AdminStates.set_subscribe_stars)
 async def process_subscribe_stars(message: Message, state: FSMContext):
@@ -603,8 +707,91 @@ async def process_subscribe_stars(message: Message, state: FSMContext):
         set_setting("subscribe_stars", val)
         await state.clear()
         await message.answer(f"✅ Obuna stars: <b>{val}⭐</b>", reply_markup=admin_keyboard(), parse_mode="HTML")
-    except:
+    except Exception:
         await message.answer("❌ Raqam kiriting! Masalan: 0.10")
+
+
+@router.callback_query(F.data == "admin_add_balance")
+async def admin_add_balance(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.add_balance_input)
+    await call.message.edit_text(
+        "💰 <b>Balans qo'shish</b>\n\n"
+        "Formatda yuboring:\n"
+        "<code>USER_ID MIQDOR</code>\n\n"
+        "Masalan: <code>123456789 10.5</code>",
+        reply_markup=back_kb("admin_panel"),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.message(AdminStates.add_balance_input)
+async def process_add_balance(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        parts = message.text.strip().split()
+        uid   = int(parts[0])
+        amt   = float(parts[1])
+        if not get_user(uid):
+            await message.answer("❌ Foydalanuvchi topilmadi!")
+            return
+        add_balance(uid, amt, "Admin tomonidan qo'shildi")
+        await state.clear()
+        new_bal = get_balance(uid)
+        await message.answer(
+            f"✅ {uid} ga <b>+{amt}⭐</b> qo'shildi!\nYangi balans: <b>{new_bal}⭐</b>",
+            reply_markup=admin_keyboard(),
+            parse_mode="HTML"
+        )
+        try:
+            await bot.send_message(uid, f"💰 Hisobingizga <b>+{amt}⭐</b> qo'shildi!", parse_mode="HTML")
+        except Exception:
+            pass
+    except Exception:
+        await message.answer("❌ Format: <code>USER_ID MIQDOR</code>", parse_mode="HTML")
+
+
+@router.callback_query(F.data == "admin_deduct_balance")
+async def admin_deduct_balance(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.deduct_balance_input)
+    await call.message.edit_text(
+        "💸 <b>Balans ayirish</b>\n\n"
+        "Formatda yuboring:\n"
+        "<code>USER_ID MIQDOR</code>\n\n"
+        "Masalan: <code>123456789 5.0</code>",
+        reply_markup=back_kb("admin_panel"),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.message(AdminStates.deduct_balance_input)
+async def process_deduct_balance(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        parts = message.text.strip().split()
+        uid   = int(parts[0])
+        amt   = float(parts[1])
+        if not get_user(uid):
+            await message.answer("❌ Foydalanuvchi topilmadi!")
+            return
+        deduct_balance(uid, amt, "Admin tomonidan ayirildi")
+        await state.clear()
+        new_bal = get_balance(uid)
+        await message.answer(
+            f"✅ {uid} dan <b>-{amt}⭐</b> ayirildi!\nYangi balans: <b>{new_bal}⭐</b>",
+            reply_markup=admin_keyboard(),
+            parse_mode="HTML"
+        )
+    except Exception:
+        await message.answer("❌ Format: <code>USER_ID MIQDOR</code>", parse_mode="HTML")
+
 
 @router.callback_query(F.data == "admin_stats")
 async def admin_stats(call: CallbackQuery):
@@ -613,19 +800,49 @@ async def admin_stats(call: CallbackQuery):
     total_users, total_balance = get_stats()
     ref_stars = get_setting("referral_stars")
     sub_stars = get_setting("subscribe_stars")
+
+    conn = db()
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM transactions WHERE type='credit'")
+    total_credits = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM transactions WHERE description LIKE 'Gift%'")
+    total_gifts = c.fetchone()[0]
+    conn.close()
+
     await call.message.edit_text(
         f"📊 <b>Statistika</b>\n\n"
         f"👥 Jami foydalanuvchilar: <b>{total_users}</b>\n"
-        f"💰 Jami balanslar: <b>{total_balance}⭐</b>\n\n"
+        f"💰 Jami balanslar: <b>{total_balance}⭐</b>\n"
+        f"📈 Jami kreditlar: <b>{total_credits}</b>\n"
+        f"🎁 Sotilgan giftlar: <b>{total_gifts}</b>\n\n"
         f"⚙️ Sozlamalar:\n"
         f"• Referral: <b>{ref_stars}⭐</b>\n"
         f"• Obuna: <b>{sub_stars}⭐</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Ortga", callback_data="admin_panel")]
-        ]),
+        reply_markup=back_kb("admin_panel"),
         parse_mode="HTML"
     )
     await call.answer()
+
+
+@router.callback_query(F.data == "admin_users")
+async def admin_users(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    conn = db()
+    c = conn.cursor()
+    c.execute(
+        "SELECT user_id, username, full_name, balance, referral_count FROM users "
+        "ORDER BY balance DESC LIMIT 15"
+    )
+    rows = c.fetchall()
+    conn.close()
+    text = "👥 <b>Top 15 foydalanuvchi (balans bo'yicha):</b>\n\n"
+    for i, r in enumerate(rows, 1):
+        uname = f"@{r[1]}" if r[1] else r[2]
+        text += f"{i}. {uname} — <b>{round(r[3],2)}⭐</b> | 👥{r[4]}\n"
+    await call.message.edit_text(text, reply_markup=back_kb("admin_panel"), parse_mode="HTML")
+    await call.answer()
+
 
 @router.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast(call: CallbackQuery, state: FSMContext):
@@ -634,12 +851,11 @@ async def admin_broadcast(call: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.broadcast)
     await call.message.edit_text(
         "📣 <b>Broadcast</b>\n\nBarcha foydalanuvchilarga yuboriladigan xabarni yozing:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Bekor", callback_data="admin_panel")]
-        ]),
+        reply_markup=back_kb("admin_panel"),
         parse_mode="HTML"
     )
     await call.answer()
+
 
 @router.message(AdminStates.broadcast)
 async def process_broadcast(message: Message, state: FSMContext):
@@ -652,18 +868,22 @@ async def process_broadcast(message: Message, state: FSMContext):
         try:
             await bot.send_message(uid, f"📣 {message.text}", parse_mode="HTML")
             sent += 1
-        except:
+            await asyncio.sleep(0.05)  # flood limitdan qochish
+        except Exception:
             failed += 1
     await message.answer(
         f"✅ Yuborildi!\n\n✅ Muvaffaqiyatli: {sent}\n❌ Xato: {failed}",
         reply_markup=admin_keyboard()
     )
 
+
+# ===================== MAIN =====================
 async def main():
     init_db()
     dp.include_router(router)
     logger.info("✅ Bot ishga tushdi!")
     await dp.start_polling(bot, skip_updates=True)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
