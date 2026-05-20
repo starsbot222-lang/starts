@@ -20,7 +20,7 @@ from pymongo import ReturnDocument
 # ===================== SOZLAMALAR =====================
 BOT_TOKEN     = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
 ADMIN_ID      = int(os.environ.get("ADMIN_ID", "6102256074"))
-MONGO_URI     = os.environ.get("MONGO_URI", "mongodb+srv://user:pass@cluster.mongodb.net/starsbot")
+MONGO_URL     = os.environ.get("MONGO_URL", "mongodb+srv://user:pass@cluster.mongodb.net/starsbot")
 SUPPORT_GROUP = "https://t.me/FreeStarsbotInfo"
 TIMEZONE      = pytz.timezone("Asia/Tashkent")
 # ======================================================
@@ -29,7 +29,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ===================== MongoDB =====================
-client = AsyncIOMotorClient(MONGO_URI)
+client = AsyncIOMotorClient(MONGO_URL)
 mdb    = client.get_default_database()
 
 users          = mdb["users"]
