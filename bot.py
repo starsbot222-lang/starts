@@ -1099,7 +1099,69 @@ async def process_broadcast(message: Message, state: FSMContext):
         f"✅ Yuborildi!\n✅ Muvaffaqiyatli: {sent}\n❌ Xato: {failed}",
         reply_markup=admin_keyboard()
     )
-
+async def auto_check_subscriptions():
+    """Har 6 soatda barcha foydalanuvchilarni tekshiradi"""
+    while True:
+        await asyncio.sleep(6 * 3600)  # 6 soat kutadi
+        logger.info("🔄 Avtomatik obuna tekshiruvi boshlandi...")
+        
+        chs = await get_channels()
+        if not chs:
+            continue
+            
+        sub_stars = float(await get_setting("subscribe_stars") or 0.10)
+        all_user_ids = await get_all_user_ids()
+        
+        for user_id in all_user_ids:
+            for ch in chs:
+                channel_id_str = ch["channel_id"]
+                channel_name   = ch["channel_name"]
+                try:
+                    cid = int(channel_id_str)
+                    member = await bot.get_chat_member(cid, user_id)
+                    is_member = member.status not in ["left", "kicked", "banned"]
+                except Exception:
+                    continue
+                
+                bonus_doc = await channel_bonus.find_one({
+                    "user_id": user_id,
+                    "channel_id": channel_id_str
+                })
+                
+                # Kanaldan chiqqan bo'lsa — yulduz ayir
+                if not is_member and bonus_doc:
+                    given = float(bonus_doc.get("stars_given", sub_stars))
+                    await channel_bonus.delete_one({
+                        "user_id": user_id,
+                        "channel_id": channel_id_str
+                    })
+                    current_balance = await get_balance(user_id)
+                    deduct_amount = min(given, current_balance)
+                    if deduct_amount > 0:
+                        await users.update_one(
+                            {"user_id": user_id},
+                            {"$inc": {"balance": -deduct_amount}}
+                        )
+                        await transactions.insert_one({
+                            "user_id": user_id,
+                            "amount": deduct_amount,
+                            "type": "debit",
+                            "description": f"Kanal tark etildi (auto): {channel_name}",
+                            "created_at": datetime.utcnow()
+                        })
+                        try:
+                            await bot.send_message(
+                                user_id,
+                                f"❌ <b>{channel_name}</b> kanalini tark etgansiz!\n"
+                                f"💸 -{deduct_amount}⭐ ayirildi.",
+                                parse_mode="HTML"
+                            )
+                        except Exception:
+                            pass
+                
+                await asyncio.sleep(0.05)  # Telegram limit
+        
+        logger.info("✅ Avtomatik tekshiruv tugadi.")
 # ===================== MAIN =====================
 async def main():
     await init_db()
