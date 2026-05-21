@@ -377,6 +377,7 @@ def main_menu(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⏰ Ish vaqti",        callback_data="work_hours")],
         [InlineKeyboardButton(text="🆘 Yordam / Muammo", callback_data="support")],
     ]
+    
     if user_id == ADMIN_ID:
         buttons.append([InlineKeyboardButton(text="🔧 Admin panel", callback_data="admin_panel")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1614,7 +1615,6 @@ async def admin_broadcast(call: CallbackQuery, state: FSMContext):
     )
     await call.answer()
 
-
 @router.message(AdminStates.broadcast)
 async def process_broadcast(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
@@ -1622,64 +1622,93 @@ async def process_broadcast(message: Message, state: FSMContext):
     await state.clear()
 
     user_ids = await get_all_user_ids()
-    sent, failed = 0, 0
+    sent, failed, blocked = 0, 0, 0
     status_msg = await message.answer(f"📣 Yuborilmoqda... 0/{len(user_ids)}")
 
+    async def send_to_user(uid: int) -> str:
+        """Xabar yuboradi, xato bo'lsa retry qiladi. 'sent'/'blocked'/'failed' qaytaradi"""
+        for attempt in range(3):  # 3 marta urinish
+            try:
+                if message.photo:
+                    await bot.send_photo(
+                        uid,
+                        photo=message.photo[-1].file_id,
+                        caption=f"📣 {message.caption}" if message.caption else "📣",
+                        parse_mode="HTML"
+                    )
+                elif message.video:
+                    await bot.send_video(
+                        uid,
+                        video=message.video.file_id,
+                        caption=f"📣 {message.caption}" if message.caption else "📣",
+                        parse_mode="HTML"
+                    )
+                elif message.animation:
+                    await bot.send_animation(
+                        uid,
+                        animation=message.animation.file_id,
+                        caption=f"📣 {message.caption}" if message.caption else "📣",
+                        parse_mode="HTML"
+                    )
+                elif message.text:
+                    await bot.send_message(
+                        uid,
+                        f"📣 {message.text}",
+                        parse_mode="HTML"
+                    )
+                return "sent"
+
+            except Exception as e:
+                err = str(e).lower()
+                # Foydalanuvchi botni bloklagan
+                if "blocked" in err or "deactivated" in err or "chat not found" in err:
+                    return "blocked"
+                # Flood limit — kutib qayta urinish
+                if "429" in err or "too many requests" in err:
+                    wait = 5 * (attempt + 1)  # 5s, 10s, 15s
+                    logger.warning(f"Flood limit! {wait}s kutilmoqda...")
+                    await asyncio.sleep(wait)
+                    continue
+                # Boshqa xato
+                if attempt == 2:
+                    return "failed"
+                await asyncio.sleep(1)
+        return "failed"
+
     for i, uid in enumerate(user_ids):
-        try:
-            # Rasm + caption
-            if message.photo:
-                await bot.send_photo(
-                    uid,
-                    photo=message.photo[-1].file_id,
-                    caption=f"📣 {message.caption}" if message.caption else "📣",
-                    parse_mode="HTML"
-                )
-            # Video + caption
-            elif message.video:
-                await bot.send_video(
-                    uid,
-                    video=message.video.file_id,
-                    caption=f"📣 {message.caption}" if message.caption else "📣",
-                    parse_mode="HTML"
-                )
-            # GIF / animation
-            elif message.animation:
-                await bot.send_animation(
-                    uid,
-                    animation=message.animation.file_id,
-                    caption=f"📣 {message.caption}" if message.caption else "📣",
-                    parse_mode="HTML"
-                )
-            # Faqat matn
-            elif message.text:
-                await bot.send_message(
-                    uid,
-                    f"📣 {message.text}",
-                    parse_mode="HTML"
-                )
+        result = await send_to_user(uid)
+        if result == "sent":
             sent += 1
-        except Exception:
+        elif result == "blocked":
+            blocked += 1
+        else:
             failed += 1
 
-        if (i + 1) % 50 == 0:
+        # Har 30 da bir status yangilash
+        if (i + 1) % 30 == 0:
             try:
                 await status_msg.edit_text(
                     f"📣 Yuborilmoqda... {i+1}/{len(user_ids)}\n"
-                    f"✅ {sent} | ❌ {failed}"
+                    f"✅ Yuborildi: {sent}\n"
+                    f"🚫 Bloklagan: {blocked}\n"
+                    f"❌ Xato: {failed}"
                 )
             except Exception:
                 pass
-        await asyncio.sleep(0.05)
 
-    await admin_log(ADMIN_ID, "broadcast", f"sent={sent}, failed={failed}")
+        # ✅ To'g'ri delay — Telegram 30 xabar/sekund ruxsat beradi
+        await asyncio.sleep(0.1)  # 10 xabar/sekund — xavfsiz
+
+    await admin_log(ADMIN_ID, "broadcast", f"sent={sent}, blocked={blocked}, failed={failed}")
     await status_msg.edit_text(
-        f"✅ Broadcast tugadi!\n"
-        f"✅ Muvaffaqiyatli: {sent}\n"
-        f"❌ Xato: {failed}"
+        f"✅ <b>Broadcast tugadi!</b>\n\n"
+        f"✅ Yuborildi: <b>{sent}</b>\n"
+        f"🚫 Bloklagan: <b>{blocked}</b>\n"
+        f"❌ Xato: <b>{failed}</b>\n"
+        f"📊 Jami: <b>{len(user_ids)}</b>",
+        parse_mode="HTML"
     )
     await message.answer("🏠 Admin panel:", reply_markup=admin_keyboard())
-
 # ===================== AUTO CHECK SUBSCRIPTIONS =====================
 async def auto_check_subscriptions():
     await asyncio.sleep(10)
