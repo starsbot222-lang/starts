@@ -55,7 +55,6 @@ admin_logs       = mdb["admin_logs"]
 referral_hourly  = mdb["referral_hourly"]
 support_cooldown = mdb["support_cooldown"]
 channel_bonus    = mdb["user_channel_bonus"]
-# ✅ YANGI: join request kutayotganlarni saqlash
 pending_joins    = mdb["pending_join_requests"]
 
 
@@ -95,7 +94,6 @@ async def init_db():
         "last_sent_at",
         expireAfterSeconds=7200
     )
-    # ✅ YANGI: pending joins indeksi
     await pending_joins.create_index(
         [("user_id", 1), ("channel_id", 1)], unique=True
     )
@@ -172,10 +170,7 @@ async def add_balance(user_id: int, amount: float, desc: str = ""):
 
 async def deduct_balance(user_id: int, amount: float, desc: str = "") -> bool:
     result = await users.find_one_and_update(
-        {
-            "user_id": user_id,
-            "balance": {"$gte": amount}
-        },
+        {"user_id": user_id, "balance": {"$gte": amount}},
         {"$inc": {"balance": -amount}},
         return_document=ReturnDocument.AFTER
     )
@@ -203,7 +198,7 @@ async def get_channels():
 async def add_channel(channel_id: str, name: str, link: str):
     await channels.update_one(
         {"channel_id": channel_id},
-        {"$setOnInsert": {
+        {"$set": {
             "channel_id": channel_id,
             "channel_name": name,
             "channel_link": link
@@ -311,12 +306,10 @@ async def update_support_cooldown(user_id: int):
     )
 
 
-# ✅ YANGI: is_member_or_pending — join request ham hisobga olinadi
 async def is_member_or_pending(channel_id_str: str, user_id: int) -> bool:
     """
-    Foydalanuvchi kanalda member yoki join request yuborgan bo'lsa True qaytaradi.
+    pending_joins da bor bo'lsa yoki kanalda member bo'lsa True qaytaradi.
     """
-    # 1. Avval pending_joins da tekshir
     pending = await pending_joins.find_one({
         "user_id": user_id,
         "channel_id": channel_id_str
@@ -324,7 +317,6 @@ async def is_member_or_pending(channel_id_str: str, user_id: int) -> bool:
     if pending:
         return True
 
-    # 2. get_chat_member orqali tekshir
     try:
         cid = int(channel_id_str)
         member = await bot.get_chat_member(cid, user_id)
@@ -447,50 +439,21 @@ def back_kb(cb: str = "back_main") -> InlineKeyboardMarkup:
     ])
 
 
-# ===================== KANAL YORDAMCHILARI =====================
-async def resolve_channel(link_or_username: str):
-    raw = link_or_username.strip()
-
-    if "t.me/+" in raw or raw.startswith("+"):
-        return None, None
-
-    if raw.lstrip("-").isdigit():
-        try:
-            chat = await bot.get_chat(int(raw))
-            return str(chat.id), chat.title or raw
-        except Exception as e:
-            logger.warning(f"ID bo'yicha topilmadi: {raw} — {e}")
-            return None, None
-
-    if "t.me/" in raw:
-        part = raw.split("t.me/")[-1].split("/")[0].strip()
-        username = "@" + part if not part.startswith("@") else part
-    elif raw.startswith("@"):
-        username = raw
-    else:
-        username = "@" + raw
-
-    try:
-        chat = await bot.get_chat(username)
-        return str(chat.id), chat.title or username
-    except Exception as e:
-        logger.warning(f"Username topilmadi: {username} — {e}")
-        return None, None
-
-
-# ===================== ✅ JOIN REQUEST HANDLER =====================
+# ===================== JOIN REQUEST HANDLER =====================
 @router.chat_join_request()
 async def handle_join_request(update: ChatJoinRequest):
     """
-    Foydalanuvchi join request yuborganda bu handler ishga tushadi.
-    pending_joins ga yozib qo'yamiz va so'ng tasdiqlash uchun approve qilamiz.
+    Foydalanuvchi join request yuborganda ishga tushadi.
+    1. pending_joins ga yozadi
+    2. Avtomatik tasdiqlaydi
+    3. Stars beradi
     """
     user_id    = update.from_user.id
     channel_id = str(update.chat.id)
 
-    logger.info(f"Join request: user={user_id}, channel={channel_id}")
+    logger.info(f"Join request keldi: user={user_id}, channel={channel_id}")
 
-    # pending_joins ga yoz
+    # 1. pending_joins ga yoz
     try:
         await pending_joins.update_one(
             {"user_id": user_id, "channel_id": channel_id},
@@ -504,21 +467,23 @@ async def handle_join_request(update: ChatJoinRequest):
     except Exception as e:
         logger.error(f"pending_joins yozishda xato: {e}")
 
-    # ✅ Join requestni avtomatik tasdiqlash
+    # 2. Avtomatik tasdiqlash
     try:
         await bot.approve_chat_join_request(update.chat.id, user_id)
-        logger.info(f"✅ Join request tasdiqlandi: user={user_id}, channel={channel_id}")
+        logger.info(f"✅ Tasdiqlandi: user={user_id}, channel={channel_id}")
     except Exception as e:
-        logger.warning(f"approve_chat_join_request xato: {e}")
+        logger.warning(f"approve xato: {e}")
 
-    # Bonus berish — channel_bonus da yo'q bo'lsa
+    # 3. Kanal bazada bormi tekshir
     ch = await channels.find_one({"channel_id": channel_id})
     if not ch:
+        logger.warning(f"Kanal bazada topilmadi: {channel_id}")
         return
 
-    sub_stars = float(await get_setting("subscribe_stars") or 0.10)
+    sub_stars    = float(await get_setting("subscribe_stars") or 0.10)
     channel_name = ch.get("channel_name", "Kanal")
 
+    # 4. Bonus oldindan berilganmi?
     bonus_doc = await channel_bonus.find_one({
         "user_id": user_id,
         "channel_id": channel_id
@@ -534,7 +499,6 @@ async def handle_join_request(update: ChatJoinRequest):
             await add_balance(user_id, sub_stars, f"Kanal obuna bonusi: {channel_name}")
             balance = await get_balance(user_id)
             logger.info(f"✅ Bonus berildi: user={user_id}, +{sub_stars}⭐")
-
             try:
                 await bot.send_message(
                     user_id,
@@ -548,12 +512,12 @@ async def handle_join_request(update: ChatJoinRequest):
         except DuplicateKeyError:
             pass
         except Exception as e:
-            logger.error(f"Join request bonusda xato: {e}")
+            logger.error(f"Bonus berishda xato: {e}")
 
 
-# ===================== CHANNELS RENDER HELPER =====================
+# ===================== CHANNELS RENDER =====================
 async def render_channels_menu(user_id: int, message) -> None:
-    chs = await get_channels()
+    chs       = await get_channels()
     sub_stars = await get_setting("subscribe_stars") or "0.10"
 
     if not chs:
@@ -566,17 +530,8 @@ async def render_channels_menu(user_id: int, message) -> None:
     buttons = []
     for ch in chs:
         channel_id_str = ch["channel_id"]
-
-        # ✅ is_member_or_pending ishlatamiz
-        is_member = await is_member_or_pending(channel_id_str, user_id)
-
-        bonus_doc = await channel_bonus.find_one({
-            "user_id": user_id,
-            "channel_id": channel_id_str
-        })
-
-        icon = "✅" if is_member else "❌"
-
+        is_member      = await is_member_or_pending(channel_id_str, user_id)
+        icon           = "✅" if is_member else "❌"
         buttons.append([
             InlineKeyboardButton(
                 text=f"{icon} {ch['channel_name']}",
@@ -616,7 +571,7 @@ async def cmd_start(message: Message, state: FSMContext):
     full_name = message.from_user.full_name or ""
     args      = message.text.split()
 
-    is_new = (await get_user(user_id)) is None
+    is_new      = (await get_user(user_id)) is None
     referred_by = None
 
     if len(args) > 1:
@@ -654,7 +609,7 @@ async def cmd_start(message: Message, state: FSMContext):
                     ADMIN_ID,
                     f"⚠️ <b>Shubhali referral faoliyat!</b>\n\n"
                     f"Referrer ID: <code>{referred_by}</code>\n"
-                    f"1 soatda 5+ yangi foydalanuvchi qo'shdi. Stars berilmadi.",
+                    f"1 soatda 5+ yangi foydalanuvchi. Stars berilmadi.",
                     parse_mode="HTML"
                 )
             except Exception:
@@ -681,7 +636,7 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "work_hours")
 async def work_hours_info(call: CallbackQuery):
-    now = datetime.now(TIMEZONE)
+    now    = datetime.now(TIMEZONE)
     status = (
         "🟢 <b>Hozir ish vaqti!</b> Gift buyurtma bera olasiz."
         if is_working_hours() else
@@ -730,7 +685,7 @@ async def show_referral(call: CallbackQuery):
     bot_info  = await bot.get_me()
     ref_link  = f"https://t.me/{bot_info.username}?start={user_id}"
 
-    remaining = max(0, MIN_REFERRALS_FOR_GIFT - ref_count)
+    remaining     = max(0, MIN_REFERRALS_FOR_GIFT - ref_count)
     progress_text = (
         f"✅ <b>Gift olish huquqingiz bor!</b>"
         if remaining == 0
@@ -759,7 +714,7 @@ async def show_referral(call: CallbackQuery):
 @router.callback_query(F.data == "transactions")
 async def show_transactions(call: CallbackQuery):
     user_id = call.from_user.id
-    txs = await transactions.find(
+    txs     = await transactions.find(
         {"user_id": user_id}
     ).sort("created_at", -1).limit(10).to_list(length=10)
     if not txs:
@@ -786,7 +741,6 @@ async def show_channels(call: CallbackQuery):
     await render_channels_menu(call.from_user.id, call.message)
 
 
-# ✅ Har bir kanal uchun alohida tekshirish — is_member_or_pending ishlatadi
 @router.callback_query(F.data.startswith("checksub_"))
 async def check_single_sub(call: CallbackQuery):
     user_id        = call.from_user.id
@@ -799,13 +753,9 @@ async def check_single_sub(call: CallbackQuery):
         return
 
     channel_name = ch["channel_name"]
-
-    # ✅ is_member_or_pending ishlatamiz
-    is_member = await is_member_or_pending(channel_id_str, user_id)
-
-    bonus_doc = await channel_bonus.find_one({
-        "user_id": user_id,
-        "channel_id": channel_id_str
+    is_member    = await is_member_or_pending(channel_id_str, user_id)
+    bonus_doc    = await channel_bonus.find_one({
+        "user_id": user_id, "channel_id": channel_id_str
     })
 
     result_text = ""
@@ -818,28 +768,23 @@ async def check_single_sub(call: CallbackQuery):
                 "stars_given": sub_stars
             })
             await add_balance(user_id, sub_stars, f"Kanal obuna bonusi: {channel_name}")
-            balance = await get_balance(user_id)
+            balance     = await get_balance(user_id)
             result_text = f"✅ {channel_name}\n➕ +{sub_stars}⭐ qo'shildi!\n💰 Balans: {balance}⭐"
         except DuplicateKeyError:
             result_text = f"✅ {channel_name}\nBonus oldin olingan"
         except Exception as e:
-            logger.error(f"Bonus qo'shishda xato {channel_name}: {e}")
+            logger.error(f"Bonus qo'shishda xato: {e}")
             result_text = f"⚠️ {channel_name} — xato yuz berdi"
-
     elif is_member and bonus_doc:
         result_text = f"✅ {channel_name}\nBonus allaqachon olingan"
-
     elif not is_member and bonus_doc:
         given = float(bonus_doc.get("stars_given", sub_stars))
-        await channel_bonus.delete_one({
-            "user_id": user_id,
-            "channel_id": channel_id_str
-        })
+        await channel_bonus.delete_one({"user_id": user_id, "channel_id": channel_id_str})
         current_balance = await get_balance(user_id)
         deduct_amount   = min(given, current_balance)
         if deduct_amount > 0:
             await deduct_balance(user_id, deduct_amount, f"Kanal tark etildi: {channel_name}")
-            balance = await get_balance(user_id)
+            balance     = await get_balance(user_id)
             result_text = f"❌ {channel_name}\n-{round(deduct_amount, 2)}⭐ ayirildi\n💰 Balans: {balance}⭐"
         else:
             result_text = f"❌ {channel_name}\nObuna bo'lmagansiz"
@@ -852,8 +797,8 @@ async def check_single_sub(call: CallbackQuery):
 
 @router.callback_query(F.data == "check_sub")
 async def check_sub(call: CallbackQuery):
-    user_id = call.from_user.id
-    chs     = await get_channels()
+    user_id   = call.from_user.id
+    chs       = await get_channels()
     if not chs:
         await call.answer("Hozircha kanallar yo'q!", show_alert=True)
         return
@@ -866,13 +811,9 @@ async def check_sub(call: CallbackQuery):
     for ch in chs:
         channel_id_str = ch["channel_id"]
         channel_name   = ch["channel_name"]
-
-        # ✅ is_member_or_pending ishlatamiz
-        is_member = await is_member_or_pending(channel_id_str, user_id)
-
-        bonus_doc = await channel_bonus.find_one({
-            "user_id": user_id,
-            "channel_id": channel_id_str
+        is_member      = await is_member_or_pending(channel_id_str, user_id)
+        bonus_doc      = await channel_bonus.find_one({
+            "user_id": user_id, "channel_id": channel_id_str
         })
 
         if is_member and not bonus_doc:
@@ -888,25 +829,17 @@ async def check_sub(call: CallbackQuery):
             except DuplicateKeyError:
                 results.append(f"✅ {channel_name} — bonus oldin olingan")
             except Exception as e:
-                logger.error(f"Bonus qo'shishda xato {channel_name}: {e}")
-                results.append(f"⚠️ {channel_name} — xato yuz berdi")
-
+                logger.error(f"Bonus qo'shishda xato: {e}")
+                results.append(f"⚠️ {channel_name} — xato")
         elif is_member and bonus_doc:
             results.append(f"✅ {channel_name} — bonus oldin olingan")
-
         elif not is_member and bonus_doc:
             given = float(bonus_doc.get("stars_given", sub_stars))
-            await channel_bonus.delete_one({
-                "user_id": user_id,
-                "channel_id": channel_id_str
-            })
+            await channel_bonus.delete_one({"user_id": user_id, "channel_id": channel_id_str})
             current_balance = await get_balance(user_id)
             deduct_amount   = min(given, current_balance)
             if deduct_amount > 0:
-                await deduct_balance(
-                    user_id, deduct_amount,
-                    f"Kanal tark etildi: {channel_name}"
-                )
+                await deduct_balance(user_id, deduct_amount, f"Kanal tark etildi: {channel_name}")
                 lost += deduct_amount
                 results.append(f"❌ {channel_name} — -{round(deduct_amount, 2)}⭐ ayirildi")
             else:
@@ -917,9 +850,9 @@ async def check_sub(call: CallbackQuery):
     balance = await get_balance(user_id)
     summary = ""
     if earned > 0:
-        summary += f"\n\n➕ Jami qo'shildi: +{round(earned, 2)}⭐"
+        summary += f"\n\n➕ Jami: +{round(earned, 2)}⭐"
     if lost > 0:
-        summary += f"\n➖ Jami ayirildi: -{round(lost, 2)}⭐"
+        summary += f"\n➖ Jami: -{round(lost, 2)}⭐"
     summary += f"\n💰 Balans: {balance}⭐"
 
     await call.answer("\n".join(results) + summary, show_alert=True)
@@ -935,9 +868,9 @@ async def support_menu(call: CallbackQuery):
         f"Muammo yoki savolingizni yozing, admin tez orada javob beradi.\n\n"
         f"💬 Guruhimiz: {SUPPORT_GROUP}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✏️ Xabar yozish", callback_data="support_write")],
+            [InlineKeyboardButton(text="✏️ Xabar yozish",  callback_data="support_write")],
             [InlineKeyboardButton(text="💬 Guruhga o'tish", url=SUPPORT_GROUP)],
-            [InlineKeyboardButton(text="🔙 Ortga", callback_data="back_main")],
+            [InlineKeyboardButton(text="🔙 Ortga",          callback_data="back_main")],
         ]),
         parse_mode="HTML"
     )
@@ -946,10 +879,10 @@ async def support_menu(call: CallbackQuery):
 
 @router.callback_query(F.data == "support_write")
 async def support_write(call: CallbackQuery, state: FSMContext):
-    user_id = call.from_user.id
-    allowed, minutes_left = await check_support_cooldown(user_id)
+    user_id          = call.from_user.id
+    allowed, minutes = await check_support_cooldown(user_id)
     if not allowed:
-        await call.answer(f"⏳ {minutes_left} daqiqadan keyin yozishingiz mumkin!", show_alert=True)
+        await call.answer(f"⏳ {minutes} daqiqadan keyin yozishingiz mumkin!", show_alert=True)
         return
     await state.set_state(UserStates.support_message)
     await call.message.edit_text(
@@ -961,12 +894,12 @@ async def support_write(call: CallbackQuery, state: FSMContext):
 
 @router.message(UserStates.support_message)
 async def process_support_message(message: Message, state: FSMContext):
-    user_id   = message.from_user.id
-    username  = message.from_user.username or ""
-    full_name = message.from_user.full_name or ""
-    allowed, minutes_left = await check_support_cooldown(user_id)
+    user_id          = message.from_user.id
+    username         = message.from_user.username or ""
+    full_name        = message.from_user.full_name or ""
+    allowed, minutes = await check_support_cooldown(user_id)
     if not allowed:
-        await message.answer(f"⏳ {minutes_left} daqiqadan keyin yozishingiz mumkin!")
+        await message.answer(f"⏳ {minutes} daqiqadan keyin yozishingiz mumkin!")
         await state.clear()
         return
     uname = f"@{username}" if username else full_name
@@ -989,7 +922,7 @@ async def process_support_message(message: Message, state: FSMContext):
         f"👉 {SUPPORT_GROUP}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💬 Guruhga o'tish", url=SUPPORT_GROUP)],
-            [InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="back_main")],
+            [InlineKeyboardButton(text="🏠 Bosh menyu",     callback_data="back_main")],
         ]),
         parse_mode="HTML"
     )
@@ -1020,8 +953,7 @@ async def buy_gift_menu(call: CallbackQuery):
             f"❌ Gift olish uchun kamida <b>{MIN_REFERRALS_FOR_GIFT} ta do'st</b> taklif qilishingiz kerak!\n\n"
             f"👥 Siz taklif qilganlar: <b>{ref_count}/{MIN_REFERRALS_FOR_GIFT}</b>\n"
             f"⏳ Yana <b>{remaining} ta do'st</b> kerak\n\n"
-            f"🔗 Referral linkingiz:\n<code>{ref_link}</code>\n\n"
-            f"Do'stlaringizni taklif qiling va gift oling! 🎁",
+            f"🔗 Referral linkingiz:\n<code>{ref_link}</code>",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(
                     text="📤 Do'stlarga yuborish",
@@ -1040,7 +972,6 @@ async def buy_gift_menu(call: CallbackQuery):
         f"👥 Referrallar: <b>{ref_count}/{MIN_REFERRALS_FOR_GIFT}</b> ✅\n\n"
         f"✅ = Sotib olish mumkin\n"
         f"❌ = Stars yetarli emas\n\n"
-        f"⏰ Buyurtma qabul: <b>20:00 — 00:00</b>\n\n"
         f"Qaysi giftni xohlaysiz? 👇",
         reply_markup=await gifts_keyboard(balance), parse_mode="HTML"
     )
@@ -1058,8 +989,7 @@ async def select_gift(call: CallbackQuery):
 
     if ref_count < MIN_REFERRALS_FOR_GIFT:
         await call.answer(
-            f"❌ Gift olish uchun {MIN_REFERRALS_FOR_GIFT} ta referral kerak!\n"
-            f"Sizda: {ref_count} ta",
+            f"❌ Gift olish uchun {MIN_REFERRALS_FOR_GIFT} ta referral kerak!\nSizda: {ref_count} ta",
             show_alert=True
         )
         return
@@ -1068,6 +998,7 @@ async def select_gift(call: CallbackQuery):
     if idx >= len(GIFTS):
         await call.answer("Gift topilmadi!", show_alert=True)
         return
+
     gift    = GIFTS[idx]
     balance = await get_balance(user_id)
     if balance < gift["stars"]:
@@ -1076,6 +1007,7 @@ async def select_gift(call: CallbackQuery):
             show_alert=True
         )
         return
+
     await call.message.edit_text(
         f"🎁 <b>{gift['emoji']} {gift['name']}</b>\n\n"
         f"💰 Narxi: <b>{gift['stars']}⭐</b>\n"
@@ -1103,8 +1035,7 @@ async def confirm_gift(call: CallbackQuery):
 
     if ref_count < MIN_REFERRALS_FOR_GIFT:
         await call.answer(
-            f"❌ Gift olish uchun {MIN_REFERRALS_FOR_GIFT} ta referral kerak!\n"
-            f"Sizda: {ref_count} ta",
+            f"❌ Gift olish uchun {MIN_REFERRALS_FOR_GIFT} ta referral kerak!\nSizda: {ref_count} ta",
             show_alert=True
         )
         return
@@ -1123,11 +1054,13 @@ async def confirm_gift(call: CallbackQuery):
     if idx >= len(GIFTS):
         await call.answer("Gift topilmadi!", show_alert=True)
         return
+
     gift    = GIFTS[idx]
     balance = await get_balance(user_id)
     if balance < gift["stars"]:
         await call.answer("❌ Stars yetarli emas!", show_alert=True)
         return
+
     user      = await get_user(user_id)
     username  = user.get("username") or ""
     full_name = user.get("full_name") or ""
@@ -1138,10 +1071,8 @@ async def confirm_gift(call: CallbackQuery):
         await call.answer("❌ Stars yetarli emas!", show_alert=True)
         return
 
-    order_id = await add_order(
-        user_id, username, full_name,
-        gift["name"], gift["emoji"], gift["stars"]
-    )
+    order_id = await add_order(user_id, username, full_name, gift["name"], gift["emoji"], gift["stars"])
+
     try:
         await bot.send_message(
             ADMIN_ID,
@@ -1273,11 +1204,11 @@ async def admin_add_channel_start(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text(
         "➕ <b>Kanal qo'shish</b>\n\n"
         "Quyidagilardan birini yuboring:\n\n"
-        "1️⃣ Kanaldan istalgan xabarni <b>forward qiling</b> (private kanal)\n"
-        "2️⃣ <code>@kanalname</code> (public kanal)\n"
-        "3️⃣ <code>-1001234567890</code> (kanal ID)\n\n"
-        "⚠️ Bot kanalda <b>admin</b> bo'lishi kerak!\n"
-        "Join request rejimi ham ishlaydi ✅",
+        "1️⃣ <code>https://t.me/+xxxxxx</code> (maxfiy kanal linki)\n"
+        "2️⃣ Kanaldan istalgan xabarni <b>forward qiling</b>\n"
+        "3️⃣ <code>@kanalname</code> (public kanal)\n\n"
+        "⚠️ Bot kanalda <b>admin</b> bo'lishi va\n"
+        "<b>Invite Users</b> huquqi bo'lishi kerak!",
         reply_markup=back_kb("admin_panel"),
         parse_mode="HTML"
     )
@@ -1293,20 +1224,47 @@ async def process_channel_link(message: Message, state: FSMContext):
     auto_name  = None
     link       = None
 
+    # 1. Forward qilingan xabar (maxfiy kanal uchun eng ishonchli usul)
     if message.forward_from_chat:
         chat       = message.forward_from_chat
         channel_id = str(chat.id)
         auto_name  = chat.title or "Kanal"
-       try:
-    invite = await bot.create_chat_invite_link(
-        int(channel_id),
-        creates_join_request=True  # ← MUHIM!
-    )
-    link = invite.invite_link
-except Exception:
-    link = f"https://t.me/c/{channel_id.lstrip('-100')}"
-3. handle_join_request handlerini tekshiring — kodingizda bu 
+        try:
+            invite = await bot.create_chat_invite_link(
+                int(channel_id),
+                creates_join_request=True
+            )
+            link = invite.invite_link
+        except Exception:
+            link = f"https://t.me/c/{channel_id.lstrip('-100')}"
 
+    # 2. t.me/+ link (maxfiy kanal)
+    elif message.text and ("t.me/+" in message.text or message.text.strip().startswith("https://t.me/+")):
+        raw = message.text.strip()
+        # Linkdan faqat t.me/+xxxx qismini olish
+        if "t.me/+" in raw:
+            raw = "https://t.me/+" + raw.split("t.me/+")[-1].split()[0]
+        try:
+            chat       = await bot.get_chat(raw)
+            channel_id = str(chat.id)
+            auto_name  = chat.title or "Maxfiy kanal"
+            try:
+                invite = await bot.create_chat_invite_link(
+                    int(channel_id),
+                    creates_join_request=True
+                )
+                link = invite.invite_link
+            except Exception:
+                link = raw
+        except Exception as e:
+            logger.warning(f"t.me/+ link xato: {e}")
+            # get_chat ishlamasa linkni shundayligicha saqlash
+            # Kanal ID ni join request kelganda aniqlaymiz
+            channel_id = raw  # vaqtinchalik
+            auto_name  = "Maxfiy kanal"
+            link       = raw
+
+    # 3. Kanal ID raqam
     elif message.text and message.text.strip().lstrip("-").isdigit():
         raw = message.text.strip()
         try:
@@ -1314,7 +1272,11 @@ except Exception:
             channel_id = str(chat.id)
             auto_name  = chat.title or raw
             try:
-                link = await bot.export_chat_invite_link(int(channel_id))
+                invite = await bot.create_chat_invite_link(
+                    int(channel_id),
+                    creates_join_request=True
+                )
+                link = invite.invite_link
             except Exception:
                 link = f"https://t.me/c/{channel_id.lstrip('-100')}"
         except Exception:
@@ -1325,26 +1287,9 @@ except Exception:
             )
             return
 
+    # 4. @username yoki t.me/username (public kanal)
     elif message.text:
         raw = message.text.strip()
-       if "t.me/+" in raw:
-    try:
-        chat = await bot.get_chat(raw)
-        channel_id = str(chat.id)
-        auto_name = chat.title or "Maxfiy kanal"
-        invite = await bot.create_chat_invite_link(
-            int(channel_id),
-            creates_join_request=True
-        )
-        link = invite.invite_link
-    except Exception as e:
-        await message.answer(
-            "❌ Kanal topilmadi!\n\nBot kanalda <b>admin</b> bo'lishi kerak!",
-            reply_markup=back_kb("admin_panel"),
-            parse_mode="HTML"
-        )
-        return
-
         if "t.me/" in raw:
             part     = raw.split("t.me/")[-1].split("/")[0]
             username = "@" + part
@@ -1389,7 +1334,7 @@ except Exception:
         f"📢 {auto_name}\n"
         f"🔗 {link}\n"
         f"🆔 <code>{channel_id}</code>\n\n"
-        f"✅ Join request rejimi avtomatik ishlaydi!",
+        f"✅ Join request rejimi ishlaydi!",
         reply_markup=admin_keyboard(),
         parse_mode="HTML"
     )
@@ -1428,22 +1373,14 @@ async def delete_channel(call: CallbackQuery):
     await call.answer("✅ O'chirildi!", show_alert=True)
     chs = await get_channels()
     if not chs:
-        await call.message.edit_text(
-            "✅ Barcha kanallar o'chirildi.",
-            reply_markup=admin_keyboard()
-        )
+        await call.message.edit_text("✅ Barcha kanallar o'chirildi.", reply_markup=admin_keyboard())
         return
     buttons = [
-        [InlineKeyboardButton(
-            text=f"🗑 {ch['channel_name']}",
-            callback_data=f"delch_{ch['channel_id']}"
-        )]
+        [InlineKeyboardButton(text=f"🗑 {ch['channel_name']}", callback_data=f"delch_{ch['channel_id']}")]
         for ch in chs
     ]
     buttons.append([InlineKeyboardButton(text="🔙 Ortga", callback_data="admin_panel")])
-    await call.message.edit_reply_markup(
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-    )
+    await call.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
 @router.callback_query(F.data == "admin_set_referral")
@@ -1702,7 +1639,7 @@ async def process_broadcast(message: Message, state: FSMContext):
         return
     await state.clear()
 
-    user_ids = await get_all_user_ids()
+    user_ids   = await get_all_user_ids()
     sent, failed, blocked = 0, 0, 0
     status_msg = await message.answer(f"📣 Yuborilmoqda... 0/{len(user_ids)}")
 
@@ -1761,11 +1698,11 @@ async def process_broadcast(message: Message, state: FSMContext):
     await message.answer("🏠 Admin panel:", reply_markup=admin_keyboard())
 
 
-# ===================== AUTO CHECK SUBSCRIPTIONS =====================
+# ===================== AUTO CHECK =====================
 async def auto_check_subscriptions():
     await asyncio.sleep(10)
     while True:
-        logger.info("🔄 Avtomatik obuna tekshiruvi boshlandi...")
+        logger.info("🔄 Avtomatik obuna tekshiruvi...")
         chs = await get_channels()
         if chs:
             sub_stars    = float(await get_setting("subscribe_stars") or 0.10)
@@ -1774,33 +1711,18 @@ async def auto_check_subscriptions():
                 for ch in chs:
                     channel_id_str = ch["channel_id"]
                     channel_name   = ch["channel_name"]
-
-                    # ✅ is_member_or_pending ishlatamiz
-                    is_member = await is_member_or_pending(channel_id_str, user_id)
-
-                    bonus_doc = await channel_bonus.find_one({
-                        "user_id": user_id,
-                        "channel_id": channel_id_str
+                    is_member      = await is_member_or_pending(channel_id_str, user_id)
+                    bonus_doc      = await channel_bonus.find_one({
+                        "user_id": user_id, "channel_id": channel_id_str
                     })
-
                     if not is_member and bonus_doc:
                         given = float(bonus_doc.get("stars_given", sub_stars))
-                        await channel_bonus.delete_one({
-                            "user_id": user_id,
-                            "channel_id": channel_id_str
-                        })
-                        # pending_joins dan ham o'chirish
-                        await pending_joins.delete_one({
-                            "user_id": user_id,
-                            "channel_id": channel_id_str
-                        })
+                        await channel_bonus.delete_one({"user_id": user_id, "channel_id": channel_id_str})
+                        await pending_joins.delete_one({"user_id": user_id, "channel_id": channel_id_str})
                         current_balance = await get_balance(user_id)
                         deduct_amount   = min(given, current_balance)
                         if deduct_amount > 0:
-                            await deduct_balance(
-                                user_id, deduct_amount,
-                                f"Kanal tark etildi (auto): {channel_name}"
-                            )
+                            await deduct_balance(user_id, deduct_amount, f"Kanal tark etildi: {channel_name}")
                             try:
                                 await bot.send_message(
                                     user_id,
@@ -1811,8 +1733,8 @@ async def auto_check_subscriptions():
                             except Exception:
                                 pass
                     await asyncio.sleep(0.1)
-        logger.info("✅ Avtomatik tekshiruv tugadi.")
-        await asyncio.sleep(6 * 3600)
+        logger.info("✅ Tekshiruv tugadi.")
+        await asyncio.sleep(2 * 2600)
 
 
 # ===================== MAIN =====================
