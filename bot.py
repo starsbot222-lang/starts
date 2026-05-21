@@ -1256,13 +1256,17 @@ async def process_channel_link(message: Message, state: FSMContext):
                 link = invite.invite_link
             except Exception:
                 link = raw
-        except Exception as e:
+      except Exception as e:
             logger.warning(f"t.me/+ link xato: {e}")
-            # get_chat ishlamasa linkni shundayligicha saqlash
-            # Kanal ID ni join request kelganda aniqlaymiz
-            channel_id = raw  # vaqtinchalik
-            auto_name  = "Maxfiy kanal"
-            link       = raw
+            await message.answer(
+                "❌ <b>Kanal topilmadi!</b>\n\n"
+                "Bot kanalda <b>admin</b> bo'lishi kerak!\n"
+                "Kanalga botni admin qilib, qayta urinib ko'ring.",
+                reply_markup=back_kb("admin_panel"),
+                parse_mode="HTML"
+            )
+            await state.clear()
+            return
 
     # 3. Kanal ID raqam
     elif message.text and message.text.strip().lstrip("-").isdigit():
