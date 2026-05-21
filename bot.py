@@ -27,7 +27,6 @@ SUPPORT_GROUP = os.environ.get("SUPPORT_GROUP", "https://t.me/FreeStarsbotInfo")
 TIMEZONE      = pytz.timezone("Asia/Tashkent")
 DB_NAME       = os.environ.get("DB_NAME", "starsbot")
 
-# ✅ FIX 2: Gift olish uchun minimal referral soni
 MIN_REFERRALS_FOR_GIFT = 5
 # ======================================================
 
@@ -58,7 +57,6 @@ channel_bonus    = mdb["user_channel_bonus"]
 
 
 async def init_db():
-    """MongoDB ulanishini tekshiradi, default sozlamalar va indekslar qo'shadi."""
     try:
         await client.admin.command("ping")
         logger.info("✅ MongoDB ulanishi tasdiqlandi!")
@@ -66,7 +64,6 @@ async def init_db():
         logger.critical(f"❌ MongoDB ulanishda xato: {e}")
         raise
 
-    # Default sozlamalar
     await settings_col.update_one(
         {"key": "referral_stars"},
         {"$setOnInsert": {"key": "referral_stars", "value": "0.25"}},
@@ -78,7 +75,6 @@ async def init_db():
         upsert=True
     )
 
-    # Indekslar
     await users.create_index("user_id", unique=True)
     await channels.create_index("channel_id", unique=True)
     await transactions.create_index("user_id")
@@ -92,7 +88,6 @@ async def init_db():
         "created_at",
         expireAfterSeconds=86400
     )
-    # support_cooldown TTL indeks — 2 soatdan keyin avtomatik o'chadi
     await support_cooldown.create_index(
         "last_sent_at",
         expireAfterSeconds=7200
@@ -133,19 +128,14 @@ async def get_user(user_id: int):
     return await users.find_one({"user_id": user_id})
 
 
-# ✅ FIX 1: add_user — $set bilan username/full_name yangilanadi,
-#    lekin balance, referral_count kabi muhim maydonlar $setOnInsert da qoladi.
-#    Shu tarzda GitHub deploy'dan keyin foydalanuvchilar o'CHMAYDI.
 async def add_user(user_id: int, username: str, full_name: str, referred_by=None):
     await users.update_one(
         {"user_id": user_id},
         {
-            # Har safar yangilanadigan maydonlar (profile o'zgarishi mumkin)
             "$set": {
                 "username": username,
                 "full_name": full_name,
             },
-            # Faqat birinchi marta yoziladigan maydonlar
             "$setOnInsert": {
                 "user_id": user_id,
                 "balance": 0.0,
@@ -231,7 +221,6 @@ async def get_stats():
     return total_users, total_balance, total_credits, total_gifts, pending_gifts
 
 
-# ✅ FIX 1 qo'shimcha: cursor bilan cheksiz user_id olish
 async def get_all_user_ids():
     cursor = users.find({}, {"user_id": 1})
     return [doc["user_id"] async for doc in cursor]
@@ -332,7 +321,6 @@ async def check_subscription(user_id: int):
     return len(not_subbed) == 0, not_subbed
 
 
-# ✅ FIX 2: Foydalanuvchining referral sonini tekshirish
 async def get_referral_count(user_id: int) -> int:
     user = await users.find_one({"user_id": user_id})
     return user.get("referral_count", 0) if user else 0
@@ -371,6 +359,9 @@ class UserStates(StatesGroup):
 bot    = Bot(token=BOT_TOKEN)
 dp     = Dispatcher(storage=MemoryStorage())
 router = Router()
+
+# Simple in-memory cache for admin users pagination
+_users_cache: list = []
 
 
 # ===================== KLAVIATURALAR =====================
@@ -497,13 +488,19 @@ async def render_channels_menu(user_id: int, message) -> None:
             icon = "❌"
             note = " — obuna bo'lmagansiz"
 
+        # Kanal havolasi tugmasi
         buttons.append([InlineKeyboardButton(
             text=f"{icon} {ch['channel_name']}{note}",
             url=ch["channel_link"]
         )])
+        # Har kanal uchun alohida "Tekshirish" tugmasi
+        buttons.append([InlineKeyboardButton(
+            text=f"🔄 {ch['channel_name']} ni tekshirish",
+            callback_data=f"checksub_{ch['channel_id']}"
+        )])
 
     buttons.append([InlineKeyboardButton(
-        text="🔄 Tekshirish / Yangilash",
+        text="🔄 Hammasini tekshirish",
         callback_data="check_sub"
     )])
     buttons.append([InlineKeyboardButton(text="🔙 Ortga", callback_data="back_main")])
@@ -513,7 +510,8 @@ async def render_channels_menu(user_id: int, message) -> None:
         f"Har bir kanal uchun: <b>+{sub_stars}⭐</b>\n\n"
         f"✅ = Obuna bo'lgansiz\n"
         f"❌ = Obuna bo'lmagansiz\n\n"
-        f"Obuna bo'lib <b>🔄 Tekshirish</b> ni bosing 👇",
+        f"Har bir kanal uchun alohida tekshirish yoki\n"
+        f"<b>🔄 Hammasini tekshirish</b> ni bosing 👇",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode="HTML"
     )
@@ -529,15 +527,12 @@ async def cmd_start(message: Message, state: FSMContext):
     full_name = message.from_user.full_name or ""
     args      = message.text.split()
 
-    # ✅ FIX 1: is_new tekshiruvi add_user DAN OLDIN — to'g'ri ishlaydi
     is_new = (await get_user(user_id)) is None
     referred_by = None
 
     if len(args) > 1:
         try:
             ref_id = int(args[1])
-            # ✅ FIX 3: ref_id mavjudligi + is_new tekshiruvi bir joyda
-            # Agar user allaqachon botda bo'lsa (is_new=False) — referral berilmaydi
             if ref_id != user_id and is_new:
                 referrer = await get_user(ref_id)
                 if referrer:
@@ -545,7 +540,6 @@ async def cmd_start(message: Message, state: FSMContext):
         except Exception:
             pass
 
-    # ✅ FIX 1: add_user endi $set + $setOnInsert ishlatadi — mavjud user o'CHMAYDI
     await add_user(user_id, username, full_name, referred_by)
 
     if is_new and referred_by:
@@ -621,7 +615,6 @@ async def show_balance(call: CallbackQuery):
     bot_info  = await bot.get_me()
     ref_link  = f"https://t.me/{bot_info.username}?start={user_id}"
 
-    # ✅ FIX 2: referral holati ko'rsatiladi
     ref_status = (
         f"✅ Gift olish mumkin (👥 {ref_count}/{MIN_REFERRALS_FOR_GIFT})"
         if ref_count >= MIN_REFERRALS_FOR_GIFT
@@ -648,7 +641,6 @@ async def show_referral(call: CallbackQuery):
     bot_info  = await bot.get_me()
     ref_link  = f"https://t.me/{bot_info.username}?start={user_id}"
 
-    # ✅ FIX 2: progress ko'rsatiladi
     remaining = max(0, MIN_REFERRALS_FOR_GIFT - ref_count)
     progress_text = (
         f"✅ <b>Gift olish huquqingiz bor!</b>"
@@ -703,6 +695,76 @@ async def show_channels(call: CallbackQuery):
         return
     await call.answer()
     await render_channels_menu(call.from_user.id, call.message)
+
+
+# ✅ YANGI: Har bir kanal uchun alohida tekshirish
+@router.callback_query(F.data.startswith("checksub_"))
+async def check_single_sub(call: CallbackQuery):
+    user_id    = call.from_user.id
+    channel_id_str = call.data[len("checksub_"):]
+    sub_stars  = float(await get_setting("subscribe_stars") or 0.10)
+
+    ch = await channels.find_one({"channel_id": channel_id_str})
+    if not ch:
+        await call.answer("Kanal topilmadi!", show_alert=True)
+        return
+
+    channel_name = ch["channel_name"]
+
+    try:
+        cid       = int(channel_id_str)
+        member    = await bot.get_chat_member(cid, user_id)
+        is_member = member.status not in ["left", "kicked", "banned"]
+    except Exception as e:
+        logger.warning(f"Kanal tekshirishda xato {channel_id_str}: {e}")
+        await call.answer(f"⚠️ {channel_name} — tekshirib bo'lmadi", show_alert=True)
+        return
+
+    bonus_doc = await channel_bonus.find_one({
+        "user_id": user_id,
+        "channel_id": channel_id_str
+    })
+
+    result_text = ""
+
+    if is_member and not bonus_doc:
+        try:
+            await channel_bonus.insert_one({
+                "user_id": user_id,
+                "channel_id": channel_id_str,
+                "stars_given": sub_stars
+            })
+            await add_balance(user_id, sub_stars, f"Kanal obuna bonusi: {channel_name}")
+            balance = await get_balance(user_id)
+            result_text = f"✅ {channel_name}\n➕ +{sub_stars}⭐ qo'shildi!\n💰 Balans: {balance}⭐"
+        except DuplicateKeyError:
+            result_text = f"✅ {channel_name}\nBonus oldin olingan"
+        except Exception as e:
+            logger.error(f"Bonus qo'shishda xato {channel_name}: {e}")
+            result_text = f"⚠️ {channel_name} — xato yuz berdi"
+
+    elif is_member and bonus_doc:
+        result_text = f"✅ {channel_name}\nBonus allaqachon olingan"
+
+    elif not is_member and bonus_doc:
+        given = float(bonus_doc.get("stars_given", sub_stars))
+        await channel_bonus.delete_one({
+            "user_id": user_id,
+            "channel_id": channel_id_str
+        })
+        current_balance = await get_balance(user_id)
+        deduct_amount   = min(given, current_balance)
+        if deduct_amount > 0:
+            await deduct_balance(user_id, deduct_amount, f"Kanal tark etildi: {channel_name}")
+            balance = await get_balance(user_id)
+            result_text = f"❌ {channel_name}\n-{round(deduct_amount, 2)}⭐ ayirildi\n💰 Balans: {balance}⭐"
+        else:
+            result_text = f"❌ {channel_name}\nObuna bo'lmagansiz"
+    else:
+        result_text = f"❌ {channel_name}\nObuna bo'lmagansiz — avval obuna bo'ling!"
+
+    await call.answer(result_text, show_alert=True)
+    await render_channels_menu(user_id, call.message)
 
 
 @router.callback_query(F.data == "check_sub")
@@ -872,7 +934,6 @@ async def buy_gift_menu(call: CallbackQuery):
     balance   = await get_balance(user_id)
     ref_count = await get_referral_count(user_id)
 
-    # ✅ FIX 2: Referral soni yetmasa — gift menyusi ochilmaydi
     if ref_count < MIN_REFERRALS_FOR_GIFT:
         remaining = MIN_REFERRALS_FOR_GIFT - ref_count
         bot_info  = await bot.get_me()
@@ -918,7 +979,6 @@ async def select_gift(call: CallbackQuery):
     user_id   = call.from_user.id
     ref_count = await get_referral_count(user_id)
 
-    # ✅ FIX 2: bu yerda ham tekshiruv (double-check)
     if ref_count < MIN_REFERRALS_FOR_GIFT:
         await call.answer(
             f"❌ Gift olish uchun {MIN_REFERRALS_FOR_GIFT} ta referral kerak!\n"
@@ -964,7 +1024,6 @@ async def confirm_gift(call: CallbackQuery):
     user_id   = call.from_user.id
     ref_count = await get_referral_count(user_id)
 
-    # ✅ FIX 2: final tekshiruv — buyurtma tasdiqlashda ham referral yetarliligini tekshirish
     if ref_count < MIN_REFERRALS_FOR_GIFT:
         await call.answer(
             f"❌ Gift olish uchun {MIN_REFERRALS_FOR_GIFT} ta referral kerak!\n"
@@ -1414,18 +1473,60 @@ async def admin_stats(call: CallbackQuery):
     await call.answer()
 
 
-@router.callback_query(F.data == "admin_users")
-async def admin_users_handler(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        return
-    top = await users.find().sort("balance", -1).limit(15).to_list(15)
-    text = "👥 <b>Top 15 foydalanuvchi (balans bo'yicha):</b>\n\n"
-    for i, u in enumerate(top, 1):
+# ===================== ADMIN USERS (TOP 150, PAGED) =====================
+
+async def show_users_page(message, top_list: list, page: int, edit: bool = True):
+    per_page = 50
+    total    = len(top_list)
+    start    = page * per_page
+    end      = min(start + per_page, total)
+    chunk    = top_list[start:end]
+
+    text = f"👥 <b>Top {total} foydalanuvchi ({start+1}–{end}):</b>\n\n"
+    for i, u in enumerate(chunk, start + 1):
         uname = f"@{u['username']}" if u.get("username") else u.get("full_name", "Noma'lum")
         bal   = round(u.get("balance", 0), 2)
         refs  = u.get("referral_count", 0)
         text += f"{i}. {uname} — <b>{bal}⭐</b> | 👥{refs}\n"
-    await call.message.edit_text(text, reply_markup=back_kb("admin_panel"), parse_mode="HTML")
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️ Oldingi", callback_data=f"ausers_{page-1}"))
+    if end < total:
+        nav_row.append(InlineKeyboardButton(text="Keyingi ➡️", callback_data=f"ausers_{page+1}"))
+
+    rows = []
+    if nav_row:
+        rows.append(nav_row)
+    rows.append([InlineKeyboardButton(text="🔙 Ortga", callback_data="admin_panel")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+
+    if edit:
+        await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data == "admin_users")
+async def admin_users_handler(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    global _users_cache
+    _users_cache = await users.find().sort("balance", -1).limit(150).to_list(150)
+    await show_users_page(call.message, _users_cache, page=0, edit=True)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("ausers_"))
+async def admin_users_page(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    global _users_cache
+    page = int(call.data.split("_")[1])
+    if not _users_cache:
+        _users_cache = await users.find().sort("balance", -1).limit(150).to_list(150)
+    await show_users_page(call.message, _users_cache, page=page, edit=True)
     await call.answer()
 
 
@@ -1477,7 +1578,6 @@ async def process_broadcast(message: Message, state: FSMContext):
 
 # ===================== AUTO CHECK SUBSCRIPTIONS =====================
 async def auto_check_subscriptions():
-    """Har 6 soatda barcha foydalanuvchilarni tekshiradi."""
     await asyncio.sleep(10)
     while True:
         logger.info("🔄 Avtomatik obuna tekshiruvi boshlandi...")
