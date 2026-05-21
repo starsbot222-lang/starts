@@ -537,15 +537,24 @@ async def render_channels_menu(user_id: int, message) -> None:
         })
         icon = "✅" if bonus_doc else "❌"
 
-        # Har safar yangi join request link yarat
-        try:
-            invite = await bot.create_chat_invite_link(
-                int(channel_id_str),
-                creates_join_request=True
-            )
-            link = invite.invite_link
-        except Exception:
-            link = ch["channel_link"]
+        # Bazada join_request_link bormi?
+        if ch.get("join_request_link"):
+            link = ch["join_request_link"]
+        else:
+            # Yo'q bo'lsa bir marta yarat va saqla
+            try:
+                invite = await bot.create_chat_invite_link(
+                    int(channel_id_str),
+                    creates_join_request=True
+                )
+                link = invite.invite_link
+                # Bazaga saqla
+                await channels.update_one(
+                    {"channel_id": channel_id_str},
+                    {"$set": {"join_request_link": link}}
+                )
+            except Exception:
+                link = ch["channel_link"]
 
         buttons.append([
             InlineKeyboardButton(
