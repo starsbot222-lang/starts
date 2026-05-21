@@ -1626,7 +1626,47 @@ async def auto_check_subscriptions():
                     await asyncio.sleep(0.1)
         logger.info("✅ Avtomatik tekshiruv tugadi.")
         await asyncio.sleep(6 * 3600)
+        
+async def resolve_channel(link_or_username: str):
+    raw = link_or_username.strip()
+    
+    # ✅ QO'SHILDI: Private invite link (+xxxx format)
+    if "t.me/+" in raw or raw.startswith("+"):
+        await bot.send_message(
+            ADMIN_ID,
+            "❌ Private invite link qabul qilinmaydi.\n"
+            "Kanal IDni yuboring: <code>-1001234567890</code>\n\n"
+            "IDni olish: kanalga @userinfobot qo'shing.",
+            parse_mode="HTML"
+        )
+        return None, None
+    
+    # Raqamli ID
+    if raw.lstrip("-").isdigit():
+        try:
+            chat = await bot.get_chat(int(raw))
+            return str(chat.id), chat.title or raw
+        except Exception as e:
+            logger.warning(f"Kanal topilmadi: {raw} — {e}")
+            # ✅ QO'SHILDI: Aniq xato xabari
+            return None, f"Bot kanalda admin emas yoki ID noto'g'ri: {e}"
+    
+    # Username / public link
+    if raw.startswith("https://t.me/"):
+        username = "@" + raw.split("t.me/")[-1].split("/")[0]
+    elif raw.startswith("t.me/"):
+        username = "@" + raw.split("t.me/")[-1].split("/")[0]
+    elif raw.startswith("@"):
+        username = raw
+    else:
+        username = "@" + raw
 
+    try:
+        chat = await bot.get_chat(username)
+        return str(chat.id), chat.title or username
+    except Exception as e:
+        logger.warning(f"Kanal topilmadi: {username} — {e}")
+        return None, None
 
 # ===================== MAIN =====================
 async def main():
