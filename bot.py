@@ -1327,14 +1327,23 @@ except Exception:
 
     elif message.text:
         raw = message.text.strip()
-        if "t.me/+" in raw:
-            await message.answer(
-                "❌ Bu link ishlamaydi!\n\n"
-                "Kanaldan istalgan <b>xabarni forward qiling</b> 👇",
-                reply_markup=back_kb("admin_panel"),
-                parse_mode="HTML"
-            )
-            return
+       if "t.me/+" in raw:
+    try:
+        chat = await bot.get_chat(raw)
+        channel_id = str(chat.id)
+        auto_name = chat.title or "Maxfiy kanal"
+        invite = await bot.create_chat_invite_link(
+            int(channel_id),
+            creates_join_request=True
+        )
+        link = invite.invite_link
+    except Exception as e:
+        await message.answer(
+            "❌ Kanal topilmadi!\n\nBot kanalda <b>admin</b> bo'lishi kerak!",
+            reply_markup=back_kb("admin_panel"),
+            parse_mode="HTML"
+        )
+        return
 
         if "t.me/" in raw:
             part     = raw.split("t.me/")[-1].split("/")[0]
