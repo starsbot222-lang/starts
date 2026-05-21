@@ -750,33 +750,18 @@ async def check_single_sub(call: CallbackQuery):
 
     channel_name = ch["channel_name"]
 
-    # 1. Pending join request bormi tekshir
+    # Faqat pending_joins tekshiramiz
     pending = await pending_joins.find_one({
         "user_id": user_id,
         "channel_id": channel_id_str
     })
 
-    # 2. Agar pending bo'lsa — approve qil
-    if pending and pending.get("status") != "approved":
-        try:
-            await bot.approve_chat_join_request(int(channel_id_str), user_id)
-        except Exception as e:
-            logger.warning(f"approve xato: {e}")
-        await pending_joins.update_one(
-            {"user_id": user_id, "channel_id": channel_id_str},
-            {"$set": {"status": "approved", "approved_at": datetime.utcnow()}}
-        )
-
-    # 3. Member yoki approved pending?
-    is_member = await is_member_or_pending(channel_id_str, user_id)
-
     bonus_doc = await channel_bonus.find_one({
-        "user_id": user_id, "channel_id": channel_id_str
+        "user_id": user_id,
+        "channel_id": channel_id_str
     })
 
-    result_text = ""
-
-    if is_member and not bonus_doc:
+    if pending and not bonus_doc:
         try:
             await channel_bonus.insert_one({
                 "user_id": user_id,
@@ -784,22 +769,28 @@ async def check_single_sub(call: CallbackQuery):
                 "stars_given": sub_stars
             })
             await add_balance(user_id, sub_stars, f"Kanal obuna bonusi: {channel_name}")
-            balance     = await get_balance(user_id)
-            result_text = f"✅ {channel_name} ga obuna bo'ldingiz!\n➕ +{sub_stars}⭐ qo'shildi!\n💰 Balans: {balance}⭐"
+            balance = await get_balance(user_id)
+            result_text = (
+                f"✅ {channel_name} ga join request yubordingiz!\n"
+                f"➕ +{sub_stars}⭐ qo'shildi!\n"
+                f"💰 Balans: {balance}⭐"
+            )
         except DuplicateKeyError:
-            result_text = f"✅ {channel_name}\nBonus oldin olingan"
+            result_text = f"✅ {channel_name} — bonus oldin olingan"
         except Exception as e:
-            logger.error(f"Bonus qo'shishda xato: {e}")
-            result_text = f"⚠️ {channel_name} — xato yuz berdi"
-    elif is_member and bonus_doc:
-        result_text = f"✅ {channel_name}\nBonus allaqachon olingan"
+            result_text = f"⚠️ Xato: {e}"
+    elif bonus_doc:
+        result_text = f"✅ {channel_name} — bonus allaqachon olingan"
     else:
-        result_text = f"❌ {channel_name}\nAvval kanalga obuna bo'ling!"
+        # pending_joins da yo'q = join request yuborilmagan
+        result_text = (
+            f"❌ {channel_name}\n"
+            f"Avval kanal linkiga bosib\n"
+            f"Join Request yuboring! 👆"
+        )
 
     await call.answer(result_text, show_alert=True)
     await render_channels_menu(user_id, call.message)
-
-
 
 @router.callback_query(F.data == "check_sub")
 async def check_sub(call: CallbackQuery):
