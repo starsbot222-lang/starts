@@ -436,20 +436,28 @@ def back_kb(cb: str = "back_main") -> InlineKeyboardMarkup:
 
 
 # ===================== JOIN REQUEST HANDLER =====================
+# ✅ TO'G'RI — faqat bitta handler, debug kodni ichiga qo'shing
 @router.chat_join_request()
 async def handle_join_request(update: ChatJoinRequest):
-    """
-    Foydalanuvchi join request yuborganda ishga tushadi.
-    1. pending_joins ga yozadi
-    2. Avtomatik tasdiqlaydi
-    3. Stars beradi
-    """
     user_id    = update.from_user.id
     channel_id = str(update.chat.id)
 
     logger.info(f"Join request keldi: user={user_id}, channel={channel_id}")
 
-    # 1. pending_joins ga yoz
+    # DEBUG — adminga xabar yubor
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"🔔 JOIN REQUEST KELDI!\n"
+            f"User ID: <code>{user_id}</code>\n"
+            f"Channel ID: <code>{channel_id}</code>\n"
+            f"Channel name: {update.chat.title}",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Debug xabar xato: {e}")
+
+    # pending_joins ga yoz
     try:
         await pending_joins.update_one(
             {"user_id": user_id, "channel_id": channel_id},
@@ -463,14 +471,14 @@ async def handle_join_request(update: ChatJoinRequest):
     except Exception as e:
         logger.error(f"pending_joins yozishda xato: {e}")
 
-    # 2. Avtomatik tasdiqlash
+    # Avtomatik tasdiqlash
     try:
         await bot.approve_chat_join_request(update.chat.id, user_id)
         logger.info(f"✅ Tasdiqlandi: user={user_id}, channel={channel_id}")
     except Exception as e:
         logger.warning(f"approve xato: {e}")
 
-    # 3. Kanal bazada bormi tekshir
+    # Kanal bazada bormi tekshir
     ch = await channels.find_one({"channel_id": channel_id})
     if not ch:
         logger.warning(f"Kanal bazada topilmadi: {channel_id}")
@@ -479,7 +487,6 @@ async def handle_join_request(update: ChatJoinRequest):
     sub_stars    = float(await get_setting("subscribe_stars") or 0.10)
     channel_name = ch.get("channel_name", "Kanal")
 
-    # 4. Bonus oldindan berilganmi?
     bonus_doc = await channel_bonus.find_one({
         "user_id": user_id,
         "channel_id": channel_id
@@ -509,8 +516,6 @@ async def handle_join_request(update: ChatJoinRequest):
             pass
         except Exception as e:
             logger.error(f"Bonus berishda xato: {e}")
-
-
 # ===================== CHANNELS RENDER =====================
 
 # ===================== HANDLERS =====================
