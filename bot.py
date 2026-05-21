@@ -1759,6 +1759,24 @@ async def check_db(message: Message):
     for c in chs:
         text += f"ID: `{c['channel_id']}`\nNom: {c['channel_name']}\n\n"
     await message.answer(text, parse_mode="Markdown")
+
+@router.chat_join_request()
+async def handle_join_request(update: ChatJoinRequest):
+    user_id    = update.from_user.id
+    channel_id = str(update.chat.id)
+    
+    # DEBUG — adminga xabar yubor
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"🔔 JOIN REQUEST KELDI!\n"
+            f"User ID: <code>{user_id}</code>\n"
+            f"Channel ID: <code>{channel_id}</code>\n"
+            f"Channel name: {update.chat.title}",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Debug xabar xato: {e}")
 # ===================== MAIN =====================
 async def main():
     await init_db()
