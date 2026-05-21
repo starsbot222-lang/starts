@@ -1187,47 +1187,115 @@ async def admin_orders_handler(call: CallbackQuery):
 
 
 @router.callback_query(F.data == "admin_add_channel")
+@router.callback_query(F.data == "admin_add_channel")
 async def admin_add_channel_start(call: CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
         return
     await state.set_state(AdminStates.add_channel_link)
     await call.message.edit_text(
         "➕ <b>Kanal qo'shish</b>\n\n"
-        "Public: <code>@kanalname</code> yoki <code>https://t.me/kanalname</code>\n"
-        "Maxfiy: <code>-1001234567890</code>\n\n"
-        "⚠️ Bot kanalda <b>admin</b> bo'lishi kerak!",
-        reply_markup=back_kb("admin_panel"), parse_mode="HTML"
+        "Quyidagilardan birini yuboring:\n\n"
+        "1️⃣ Kanaldan istalgan xabarni <b>forward qiling</b> (private kanal)\n"
+        "2️⃣ <code>@kanalname</code> (public kanal)\n"
+        "3️⃣ <code>-1001234567890</code> (kanal ID)\n\n"
+        "⚠️ Bot kanalda <b>admin</b> bo'lishi va\n"
+        "<b>Admin tasdiqlashini so'rash</b> o'CHIQ bo'lishi kerak!",
+        reply_markup=back_kb("admin_panel"),
+        parse_mode="HTML"
     )
     await call.answer()
 
 
 @router.message(AdminStates.add_channel_link)
+@router.message(AdminStates.add_channel_link)
 async def process_channel_link(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
-    raw = message.text.strip()
-    await message.answer("⏳ Tekshirilmoqda...")
-    channel_id, auto_name = await resolve_channel(raw)
-    if not channel_id:
-        await message.answer(
-            "❌ Kanal topilmadi!\n\nBot admin sifatida qo'shilganmi?\nID to'g'rimi?",
-            reply_markup=back_kb("admin_panel")
-        )
-        return
-    raw_lower = raw.lower()
-    if raw_lower.startswith("https://t.me/"):
-        link = raw
-    elif raw_lower.startswith("t.me/"):
-        link = "https://" + raw
-    elif raw_lower.startswith("@"):
-        link = f"https://t.me/{raw[1:]}"
-    elif raw.lstrip("-").isdigit():
+
+    channel_id = None
+    auto_name = None
+    link = None
+
+    # ✅ Forward qilingan xabar orqali ID olish
+    if message.forward_from_chat:
+        chat = message.forward_from_chat
+        channel_id = str(chat.id)
+        auto_name = chat.title or "Kanal"
         try:
             link = await bot.export_chat_invite_link(int(channel_id))
         except Exception:
             link = f"https://t.me/c/{channel_id.lstrip('-100')}"
+
+    # Raqamli ID
+    elif message.text and message.text.strip().lstrip("-").isdigit():
+        raw = message.text.strip()
+        try:
+            chat = await bot.get_chat(int(raw))
+            channel_id = str(chat.id)
+            auto_name = chat.title or raw
+            try:
+                link = await bot.export_chat_invite_link(int(channel_id))
+            except Exception:
+                link = f"https://t.me/c/{channel_id.lstrip('-100')}"
+        except Exception:
+            await message.answer(
+                "❌ <b>Kanal topilmadi!</b>\n\nBot kanalda admin bo'lishi kerak!",
+                reply_markup=back_kb("admin_panel"),
+                parse_mode="HTML"
+            )
+            return
+
+    # Public username / link
+    elif message.text:
+        raw = message.text.strip()
+        if "t.me/+" in raw:
+            await message.answer(
+                "❌ Bu link ishlamaydi!\n\n"
+                "Kanaldan istalgan <b>xabarni forward qiling</b> 👇",
+                reply_markup=back_kb("admin_panel"),
+                parse_mode="HTML"
+            )
+            return
+
+        if "t.me/" in raw:
+            part = raw.split("t.me/")[-1].split("/")[0]
+            username = "@" + part
+        elif raw.startswith("@"):
+            username = raw
+        else:
+            username = "@" + raw
+
+        try:
+            chat = await bot.get_chat(username)
+            channel_id = str(chat.id)
+            auto_name = chat.title or username
+            link = f"https://t.me/{username.lstrip('@')}"
+        except Exception:
+            await message.answer(
+                "❌ <b>Kanal topilmadi!</b>",
+                reply_markup=back_kb("admin_panel"),
+                parse_mode="HTML"
+            )
+            return
+
     else:
-        link = f"https://t.me/{raw}"
+        await message.answer(
+            "❌ Tushunmadim!\n\n"
+            "Kanaldan xabar <b>forward</b> qiling 👇",
+            reply_markup=back_kb("admin_panel"),
+            parse_mode="HTML"
+        )
+        return
+
+    if not channel_id:
+        await message.answer(
+            "❌ <b>Kanal topilmadi!</b>\n\n"
+            "Kanaldan xabar <b>forward</b> qiling!",
+            reply_markup=back_kb("admin_panel"),
+            parse_mode="HTML"
+        )
+        return
+
     await add_channel(channel_id, auto_name, link)
     await admin_log(ADMIN_ID, "add_channel", f"id={channel_id}, name={auto_name}")
     await state.clear()
@@ -1236,9 +1304,9 @@ async def process_channel_link(message: Message, state: FSMContext):
         f"📢 {auto_name}\n"
         f"🔗 {link}\n"
         f"🆔 <code>{channel_id}</code>",
-        reply_markup=admin_keyboard(), parse_mode="HTML"
+        reply_markup=admin_keyboard(),
+        parse_mode="HTML"
     )
-
 
 @router.callback_query(F.data == "admin_remove_channel")
 async def admin_remove_channel_handler(call: CallbackQuery):
@@ -1529,16 +1597,20 @@ async def admin_users_page(call: CallbackQuery):
     await show_users_page(call.message, _users_cache, page=page, edit=True)
     await call.answer()
 
-
 @router.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast(call: CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
         return
     await state.set_state(AdminStates.broadcast)
     await call.message.edit_text(
-        "📣 <b>Broadcast</b>\n\nBarcha foydalanuvchilarga xabar yozing:\n\n"
-        "<i>HTML formatlash qo'llab-quvvatlanadi</i>",
-        reply_markup=back_kb("admin_panel"), parse_mode="HTML"
+        "📣 <b>Broadcast</b>\n\n"
+        "Xabar yuboring:\n"
+        "• Faqat matn\n"
+        "• Rasm + matn (caption)\n"
+        "• Video + matn (caption)\n\n"
+        "<i>Bekor qilish: /start</i>",
+        reply_markup=back_kb("admin_panel"),
+        parse_mode="HTML"
     )
     await call.answer()
 
@@ -1548,33 +1620,65 @@ async def process_broadcast(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     await state.clear()
-    user_ids     = await get_all_user_ids()
+
+    user_ids = await get_all_user_ids()
     sent, failed = 0, 0
-    status_msg   = await message.answer(f"📣 Yuborilmoqda... 0/{len(user_ids)}")
+    status_msg = await message.answer(f"📣 Yuborilmoqda... 0/{len(user_ids)}")
+
     for i, uid in enumerate(user_ids):
         try:
-            await bot.send_message(uid, f"📣 {message.text}", parse_mode="HTML")
+            # Rasm + caption
+            if message.photo:
+                await bot.send_photo(
+                    uid,
+                    photo=message.photo[-1].file_id,
+                    caption=f"📣 {message.caption}" if message.caption else "📣",
+                    parse_mode="HTML"
+                )
+            # Video + caption
+            elif message.video:
+                await bot.send_video(
+                    uid,
+                    video=message.video.file_id,
+                    caption=f"📣 {message.caption}" if message.caption else "📣",
+                    parse_mode="HTML"
+                )
+            # GIF / animation
+            elif message.animation:
+                await bot.send_animation(
+                    uid,
+                    animation=message.animation.file_id,
+                    caption=f"📣 {message.caption}" if message.caption else "📣",
+                    parse_mode="HTML"
+                )
+            # Faqat matn
+            elif message.text:
+                await bot.send_message(
+                    uid,
+                    f"📣 {message.text}",
+                    parse_mode="HTML"
+                )
             sent += 1
         except Exception:
-            try:
-                await bot.send_message(uid, f"📣 {message.text}")
-                sent += 1
-            except Exception:
-                failed += 1
+            failed += 1
+
         if (i + 1) % 50 == 0:
             try:
                 await status_msg.edit_text(
-                    f"📣 Yuborilmoqda... {i+1}/{len(user_ids)}\n✅ {sent} | ❌ {failed}"
+                    f"📣 Yuborilmoqda... {i+1}/{len(user_ids)}\n"
+                    f"✅ {sent} | ❌ {failed}"
                 )
             except Exception:
                 pass
         await asyncio.sleep(0.05)
+
     await admin_log(ADMIN_ID, "broadcast", f"sent={sent}, failed={failed}")
     await status_msg.edit_text(
-        f"✅ Broadcast tugadi!\n✅ Muvaffaqiyatli: {sent}\n❌ Xato: {failed}"
+        f"✅ Broadcast tugadi!\n"
+        f"✅ Muvaffaqiyatli: {sent}\n"
+        f"❌ Xato: {failed}"
     )
     await message.answer("🏠 Admin panel:", reply_markup=admin_keyboard())
-
 
 # ===================== AUTO CHECK SUBSCRIPTIONS =====================
 async def auto_check_subscriptions():
