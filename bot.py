@@ -763,39 +763,33 @@ async def check_single_sub(call: CallbackQuery):
 
     channel_name = ch["channel_name"]
 
-    # Faqat pending_joins tekshiramiz
-    pending = await pending_joins.find_one({
-        "user_id": user_id,
-        "channel_id": channel_id_str
-    })
-
     bonus_doc = await channel_bonus.find_one({
         "user_id": user_id,
         "channel_id": channel_id_str
     })
+    if bonus_doc:
+        await call.answer(f"✅ {channel_name} — bonus allaqachon olingan", show_alert=True)
+        await render_channels_menu(user_id, call.message)
+        return
 
-    if pending and not bonus_doc:
-        try:
-            await channel_bonus.insert_one({
-                "user_id": user_id,
-                "channel_id": channel_id_str,
-                "stars_given": sub_stars
-            })
-            await add_balance(user_id, sub_stars, f"Kanal obuna bonusi: {channel_name}")
-            balance = await get_balance(user_id)
-            result_text = (
-                f"✅ {channel_name} ga join request yubordingiz!\n"
-                f"➕ +{sub_stars}⭐ qo'shildi!\n"
-                f"💰 Balans: {balance}⭐"
-            )
-        except DuplicateKeyError:
-            result_text = f"✅ {channel_name} — bonus oldin olingan"
-        except Exception as e:
-            result_text = f"⚠️ Xato: {e}"
-    elif bonus_doc:
-        result_text = f"✅ {channel_name} — bonus allaqachon olingan"
-    else:
-        # pending_joins da yo'q = join request yuborilmagan
+    try:
+        await bot.approve_chat_join_request(int(channel_id_str), user_id)
+        await channel_bonus.insert_one({
+            "user_id": user_id,
+            "channel_id": channel_id_str,
+            "stars_given": sub_stars
+        })
+        await add_balance(user_id, sub_stars, f"Kanal obuna bonusi: {channel_name}")
+        balance = await get_balance(user_id)
+        result_text = (
+            f"✅ {channel_name}\n"
+            f"➕ +{sub_stars}⭐ qo'shildi!\n"
+            f"💰 Balans: {balance}⭐"
+        )
+    except DuplicateKeyError:
+        result_text = f"✅ {channel_name} — bonus oldin olingan"
+    except Exception as e:
+        logger.warning(f"approve xato ({channel_id_str}): {e}")
         result_text = (
             f"❌ {channel_name}\n"
             f"Avval kanal linkiga bosib\n"
@@ -804,70 +798,6 @@ async def check_single_sub(call: CallbackQuery):
 
     await call.answer(result_text, show_alert=True)
     await render_channels_menu(user_id, call.message)
-
-@router.callback_query(F.data == "check_sub")
-async def check_sub(call: CallbackQuery):
-    user_id   = call.from_user.id
-    chs       = await get_channels()
-    if not chs:
-        await call.answer("Hozircha kanallar yo'q!", show_alert=True)
-        return
-
-    sub_stars = float(await get_setting("subscribe_stars") or 0.10)
-    results   = []
-    earned    = 0.0
-    lost      = 0.0
-
-    for ch in chs:
-        channel_id_str = ch["channel_id"]
-        channel_name   = ch["channel_name"]
-        is_member      = await is_member_or_pending(channel_id_str, user_id)
-        bonus_doc      = await channel_bonus.find_one({
-            "user_id": user_id, "channel_id": channel_id_str
-        })
-
-        if is_member and not bonus_doc:
-            try:
-                await channel_bonus.insert_one({
-                    "user_id": user_id,
-                    "channel_id": channel_id_str,
-                    "stars_given": sub_stars
-                })
-                await add_balance(user_id, sub_stars, f"Kanal obuna bonusi: {channel_name}")
-                earned += sub_stars
-                results.append(f"✅ {channel_name} — +{sub_stars}⭐ qo'shildi!")
-            except DuplicateKeyError:
-                results.append(f"✅ {channel_name} — bonus oldin olingan")
-            except Exception as e:
-                logger.error(f"Bonus qo'shishda xato: {e}")
-                results.append(f"⚠️ {channel_name} — xato")
-        elif is_member and bonus_doc:
-            results.append(f"✅ {channel_name} — bonus oldin olingan")
-        elif not is_member and bonus_doc:
-            given = float(bonus_doc.get("stars_given", sub_stars))
-            await channel_bonus.delete_one({"user_id": user_id, "channel_id": channel_id_str})
-            current_balance = await get_balance(user_id)
-            deduct_amount   = min(given, current_balance)
-            if deduct_amount > 0:
-                await deduct_balance(user_id, deduct_amount, f"Kanal tark etildi: {channel_name}")
-                lost += deduct_amount
-                results.append(f"❌ {channel_name} — -{round(deduct_amount, 2)}⭐ ayirildi")
-            else:
-                results.append(f"❌ {channel_name} — obuna bo'lmagansiz")
-        else:
-            results.append(f"❌ {channel_name} — obuna bo'lmagansiz")
-
-    balance = await get_balance(user_id)
-    summary = ""
-    if earned > 0:
-        summary += f"\n\n➕ Jami: +{round(earned, 2)}⭐"
-    if lost > 0:
-        summary += f"\n➖ Jami: -{round(lost, 2)}⭐"
-    summary += f"\n💰 Balans: {balance}⭐"
-
-    await call.answer("\n".join(results) + summary, show_alert=True)
-    await render_channels_menu(user_id, call.message)
-
 
 # ===================== SUPPORT =====================
 
@@ -1762,8 +1692,7 @@ async def check_db(message: Message):
 
 @router.chat_join_request()
 async def handle_join_request(update: ChatJoinRequest):
-    user_id    = update.from_user.id
-    channel_id = str(update.chat.id)
+    logger.info(f"Join request: user={update.from_user.id}, channel={update.chat.id}")
     
     # DEBUG — adminga xabar yubor
     try:
