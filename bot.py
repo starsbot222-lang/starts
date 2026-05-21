@@ -27,7 +27,7 @@ SUPPORT_GROUP = os.environ.get("SUPPORT_GROUP", "https://t.me/FreeStarsbotInfo")
 TIMEZONE      = pytz.timezone("Asia/Tashkent")
 DB_NAME       = os.environ.get("DB_NAME", "starsbot")
 
-MIN_REFERRALS_FOR_GIFT = 5
+MIN_REFERRALS_FOR_GIFT = 3
 # ======================================================
 
 logging.basicConfig(
