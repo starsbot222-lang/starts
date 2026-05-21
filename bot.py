@@ -302,15 +302,19 @@ async def update_support_cooldown(user_id: int):
 
 
 async def is_member(channel_id_str: str, user_id: int) -> bool:
-    """Foydalanuvchi kanalda a'zomi tekshiradi."""
     try:
-        cid    = int(channel_id_str)
+        cid = int(channel_id_str)
         member = await bot.get_chat_member(cid, user_id)
-        return member.status in ["member", "administrator", "creator", "restricted"]
+        return member.status in [
+            "member", 
+            "administrator", 
+            "creator", 
+            "restricted",
+            "kicked"  # emas
+        ]
     except Exception as e:
         logger.warning(f"get_chat_member xato {channel_id_str}: {e}")
         return False
-
 
 async def check_subscription(user_id: int):
     chs = await get_channels()
