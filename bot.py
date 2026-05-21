@@ -1297,10 +1297,15 @@ async def process_channel_link(message: Message, state: FSMContext):
         chat       = message.forward_from_chat
         channel_id = str(chat.id)
         auto_name  = chat.title or "Kanal"
-        try:
-            link = await bot.export_chat_invite_link(int(channel_id))
-        except Exception:
-            link = f"https://t.me/c/{channel_id.lstrip('-100')}"
+       try:
+    invite = await bot.create_chat_invite_link(
+        int(channel_id),
+        creates_join_request=True  # ← MUHIM!
+    )
+    link = invite.invite_link
+except Exception:
+    link = f"https://t.me/c/{channel_id.lstrip('-100')}"
+3. handle_join_request handlerini tekshiring — kodingizda bu 
 
     elif message.text and message.text.strip().lstrip("-").isdigit():
         raw = message.text.strip()
