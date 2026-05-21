@@ -512,7 +512,18 @@ async def handle_join_request(update: ChatJoinRequest):
 
 
 # ===================== CHANNELS RENDER =====================
-async def render_channels_menu(user_id: int, message) -> None:
+
+# ===================== HANDLERS =====================
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    user_id   = message.from_user.id
+    username  = message.from_user.username or ""
+    full_name = message.from_user.full_name or ""
+    args      = message.text.split()
+
+    is_new      = (await get_user(user_id)) is async def render_channels_menu(user_id: int, message) -> None:
     chs       = await get_channels()
     sub_stars = await get_setting("subscribe_stars") or "0.10"
 
@@ -526,12 +537,27 @@ async def render_channels_menu(user_id: int, message) -> None:
     buttons = []
     for ch in chs:
         channel_id_str = ch["channel_id"]
-        is_member      = await is_member_or_pending(channel_id_str, user_id)
-        icon           = "✅" if is_member else "❌"
+        is_joined      = await pending_joins.find_one({
+            "user_id": user_id,
+            "channel_id": channel_id_str
+        })
+        icon = "✅" if is_joined else "❌"
+
+        # Har safar yangi join request link yarat
+        try:
+            invite = await bot.create_chat_invite_link(
+                int(channel_id_str),
+                creates_join_request=True,
+                # expire_date=None — muddatsiz
+            )
+            link = invite.invite_link
+        except Exception:
+            link = ch["channel_link"]  # fallback
+
         buttons.append([
             InlineKeyboardButton(
                 text=f"{icon} {ch['channel_name']}",
-                url=ch["channel_link"]
+                url=link  # yangi link
             ),
             InlineKeyboardButton(
                 text="🔄 Tekshirish",
@@ -548,27 +574,13 @@ async def render_channels_menu(user_id: int, message) -> None:
     await message.edit_text(
         f"📢 <b>Kanallarga obuna bo'ling</b>\n\n"
         f"Har bir kanal uchun: <b>+{sub_stars}⭐</b>\n\n"
-        f"✅ = Obuna bo'lgansiz\n"
-        f"❌ = Obuna bo'lmagansiz\n\n"
-        f"Kanal nomiga bosib obuna bo'ling,\n"
-        f"Obunadan so'ng 5 soniya kutib keyingisiga o'ting\n"
+        f"✅ = Join request yuborgansiz\n"
+        f"❌ = Yubormagansiz\n\n"
+        f"Kanal nomiga bosib join request yuboring,\n"
         f"keyin <b>🔄 Tekshirish</b> tugmasini bosing 👇",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode="HTML"
-    )
-
-
-# ===================== HANDLERS =====================
-
-@router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
-    await state.clear()
-    user_id   = message.from_user.id
-    username  = message.from_user.username or ""
-    full_name = message.from_user.full_name or ""
-    args      = message.text.split()
-
-    is_new      = (await get_user(user_id)) is None
+    )None
     referred_by = None
 
     if len(args) > 1:
