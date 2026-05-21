@@ -9,7 +9,6 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ChatJoinRequest
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -55,7 +54,6 @@ admin_logs       = mdb["admin_logs"]
 referral_hourly  = mdb["referral_hourly"]
 support_cooldown = mdb["support_cooldown"]
 channel_bonus    = mdb["user_channel_bonus"]
-pending_joins    = mdb["pending_join_requests"]
 
 
 async def init_db():
@@ -93,9 +91,6 @@ async def init_db():
     await support_cooldown.create_index(
         "last_sent_at",
         expireAfterSeconds=7200
-    )
-    await pending_joins.create_index(
-        [("user_id", 1), ("channel_id", 1)], unique=True
     )
     logger.info("✅ Indekslar tayyor!")
 
@@ -306,14 +301,8 @@ async def update_support_cooldown(user_id: int):
     )
 
 
-async def is_member_or_pending(channel_id_str: str, user_id: int) -> bool:
-    """Foydalanuvchi kanalda a'zo yoki pending_joins da bormi tekshiradi."""
-    pending = await pending_joins.find_one({
-        "user_id": user_id,
-        "channel_id": channel_id_str
-    })
-    if pending:
-        return True
+async def is_member(channel_id_str: str, user_id: int) -> bool:
+    """Foydalanuvchi kanalda a'zomi tekshiradi."""
     try:
         cid    = int(channel_id_str)
         member = await bot.get_chat_member(cid, user_id)
@@ -329,7 +318,7 @@ async def check_subscription(user_id: int):
         return True, []
     not_subbed = []
     for ch in chs:
-        ok = await is_member_or_pending(ch["channel_id"], user_id)
+        ok = await is_member(ch["channel_id"], user_id)
         if not ok:
             not_subbed.append(ch)
     return len(not_subbed) == 0, not_subbed
@@ -338,34 +327,6 @@ async def check_subscription(user_id: int):
 async def get_referral_count(user_id: int) -> int:
     user = await users.find_one({"user_id": user_id})
     return user.get("referral_count", 0) if user else 0
-
-
-# ===================== JOIN REQUEST LINK YARAT =====================
-
-async def get_or_create_join_request_link(channel_id_str: str, fallback_link: str) -> str:
-    """
-    Kanalning join_request_link sini qaytaradi.
-    Agar bazada yo'q bo'lsa, bir marta yaratadi va saqlaydi.
-    """
-    ch = await channels.find_one({"channel_id": channel_id_str})
-    if ch and ch.get("join_request_link"):
-        return ch["join_request_link"]
-
-    try:
-        invite = await bot.create_chat_invite_link(
-            int(channel_id_str),
-            creates_join_request=True
-        )
-        link = invite.invite_link
-        await channels.update_one(
-            {"channel_id": channel_id_str},
-            {"$set": {"join_request_link": link}}
-        )
-        logger.info(f"✅ Yangi join_request_link yaratildi: {channel_id_str}")
-        return link
-    except Exception as e:
-        logger.warning(f"join_request_link yaratishda xato ({channel_id_str}): {e}")
-        return fallback_link
 
 
 # ===================== GIFTS =====================
@@ -469,7 +430,7 @@ def back_kb(cb: str = "back_main") -> InlineKeyboardMarkup:
 async def render_channels_menu(user_id: int, message) -> None:
     """
     Kanallar menyusini render qiladi.
-    Har bir kanal uchun join_request_link ishlatiladi.
+    Oddiy channel_link ishlatiladi (join request yo'q).
     Foydalanuvchi avval bonus olgan bo'lsa ✅, bo'lmasa ❌ ko'rinadi.
     """
     chs       = await get_channels()
@@ -493,11 +454,8 @@ async def render_channels_menu(user_id: int, message) -> None:
         })
         icon = "✅" if bonus_doc else "❌"
 
-        # Join request link (bazada bo'lsa ishlatadi, yo'q bo'lsa yaratadi)
-        link = await get_or_create_join_request_link(
-            channel_id_str,
-            ch.get("channel_link", "")
-        )
+        # Oddiy kanal linki
+        link = ch.get("channel_link", "")
 
         buttons.append([
             InlineKeyboardButton(
@@ -521,85 +479,11 @@ async def render_channels_menu(user_id: int, message) -> None:
         f"Har bir kanal uchun: <b>+{sub_stars}⭐</b>\n\n"
         f"✅ = Bonus olindi\n"
         f"❌ = Hali bonus olinmagan\n\n"
-        f"Kanal nomiga bosib <b>Join Request</b> yuboring,\n"
+        f"Kanal nomiga bosib obuna bo'ling,\n"
         f"keyin <b>🔄 Tekshirish</b> tugmasini bosing 👇",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode="HTML"
     )
-
-
-# ===================== JOIN REQUEST HANDLER =====================
-# FAQAT BITTA handler — join request kelganda avtomatik tasdiqlaydi va bonus beradi
-
-@router.chat_join_request()
-async def handle_join_request(update: ChatJoinRequest):
-    user_id    = update.from_user.id
-    channel_id = str(update.chat.id)
-
-    logger.info(f"Join request keldi: user={user_id}, channel={channel_id}")
-
-    # pending_joins ga yoz (bonus tekshirish uchun)
-    try:
-        await pending_joins.update_one(
-            {"user_id": user_id, "channel_id": channel_id},
-            {"$set": {
-                "user_id": user_id,
-                "channel_id": channel_id,
-                "requested_at": datetime.utcnow()
-            }},
-            upsert=True
-        )
-    except Exception as e:
-        logger.error(f"pending_joins yozishda xato: {e}")
-
-    # Avtomatik tasdiqlash
-    try:
-        await bot.approve_chat_join_request(update.chat.id, user_id)
-        logger.info(f"✅ Tasdiqlandi: user={user_id}, channel={channel_id}")
-    except Exception as e:
-        logger.warning(f"approve xato (ehtimol allaqachon a'zo): {e}")
-
-    # Kanal bazada bormi?
-    ch = await channels.find_one({"channel_id": channel_id})
-    if not ch:
-        logger.warning(f"Kanal bazada topilmadi: {channel_id}")
-        return
-
-    sub_stars    = float(await get_setting("subscribe_stars") or 0.10)
-    channel_name = ch.get("channel_name", "Kanal")
-
-    # Bonus allaqachon berilganmi?
-    bonus_doc = await channel_bonus.find_one({
-        "user_id": user_id,
-        "channel_id": channel_id
-    })
-
-    if not bonus_doc:
-        try:
-            await channel_bonus.insert_one({
-                "user_id": user_id,
-                "channel_id": channel_id,
-                "stars_given": sub_stars
-            })
-            await add_balance(user_id, sub_stars, f"Kanal obuna bonusi: {channel_name}")
-            balance = await get_balance(user_id)
-            logger.info(f"✅ Bonus berildi: user={user_id}, +{sub_stars}⭐")
-            try:
-                await bot.send_message(
-                    user_id,
-                    f"✅ <b>{channel_name}</b> kanaliga qo'shildingiz!\n"
-                    f"➕ <b>+{sub_stars}⭐</b> hisobingizga qo'shildi!\n"
-                    f"💰 Balans: <b>{balance}⭐</b>",
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                logger.warning(f"Foydalanuvchiga xabar yuborishda xato: {e}")
-        except DuplicateKeyError:
-            logger.info(f"Bonus allaqachon berilgan (DuplicateKeyError): user={user_id}")
-        except Exception as e:
-            logger.error(f"Bonus berishda xato: {e}")
-    else:
-        logger.info(f"Bonus allaqachon berilgan: user={user_id}, channel={channel_id}")
 
 
 # ===================== START HANDLER =====================
@@ -610,7 +494,6 @@ async def cmd_start(message: Message):
     username  = message.from_user.username or ""
     full_name = message.from_user.full_name or ""
 
-    # Referral parametrini tekshir
     args = message.text.split()
     referred_by = None
     if len(args) > 1:
@@ -621,11 +504,9 @@ async def cmd_start(message: Message):
         except ValueError:
             pass
 
-    # Foydalanuvchi yangi bo'lsa referral hisoblab ber
     existing = await get_user(user_id)
     await add_user(user_id, username, full_name, referred_by)
 
-    # Agar yangi foydalanuvchi va referral bor bo'lsa
     if not existing and referred_by:
         abuse_ok = await check_referral_abuse(referred_by)
         if abuse_ok:
@@ -775,7 +656,7 @@ async def show_channels(call: CallbackQuery):
 
 @router.callback_query(F.data == "check_sub")
 async def check_all_subs(call: CallbackQuery):
-    """Barcha kanallarni tekshirish — faqat bonus berilganini ko'rsatadi."""
+    """Barcha kanallarni tekshirish."""
     user_id   = call.from_user.id
     chs       = await get_channels()
     sub_stars = float(await get_setting("subscribe_stars") or 0.10)
@@ -797,9 +678,8 @@ async def check_all_subs(call: CallbackQuery):
             given_count += 1
             continue
 
-        # pending_joins da bormi yoki a'zomi?
-        is_member = await is_member_or_pending(channel_id_str, user_id)
-        if is_member:
+        ok = await is_member(channel_id_str, user_id)
+        if ok:
             try:
                 await channel_bonus.insert_one({
                     "user_id": user_id,
@@ -823,11 +703,7 @@ async def check_all_subs(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("checksub_"))
 async def check_single_sub(call: CallbackQuery):
-    """
-    Bitta kanalning tekshirish tugmasi.
-    Agar foydalanuvchi join request yuborgan bo'lsa (pending_joins da) yoki
-    a'zo bo'lsa — bonus beradi.
-    """
+    """Bitta kanal tekshirish tugmasi."""
     user_id        = call.from_user.id
     channel_id_str = call.data[len("checksub_"):]
     sub_stars      = float(await get_setting("subscribe_stars") or 0.10)
@@ -839,7 +715,6 @@ async def check_single_sub(call: CallbackQuery):
 
     channel_name = ch["channel_name"]
 
-    # Allaqachon bonus olganmi?
     bonus_doc = await channel_bonus.find_one({
         "user_id": user_id,
         "channel_id": channel_id_str
@@ -849,18 +724,15 @@ async def check_single_sub(call: CallbackQuery):
         await render_channels_menu(user_id, call.message)
         return
 
-    # pending_joins da bormi yoki a'zomi?
-    is_member = await is_member_or_pending(channel_id_str, user_id)
-    if not is_member:
+    ok = await is_member(channel_id_str, user_id)
+    if not ok:
         await call.answer(
             f"❌ {channel_name}\n"
-            f"Avval kanal linkiga bosib\n"
-            f"Join Request yuboring! 👆",
+            f"Avval kanalga obuna bo'ling! 👆",
             show_alert=True
         )
         return
 
-    # Bonus ber
     try:
         await channel_bonus.insert_one({
             "user_id": user_id,
@@ -1233,8 +1105,7 @@ async def admin_add_channel_start(call: CallbackQuery, state: FSMContext):
         "2️⃣ Kanaldan istalgan xabarni <b>forward qiling</b>\n"
         "3️⃣ <code>@kanalname</code> (public kanal)\n"
         "4️⃣ Kanal ID raqami\n\n"
-        "⚠️ Bot kanalda <b>admin</b> bo'lishi va\n"
-        "<b>Invite Users</b> huquqi bo'lishi kerak!",
+        "⚠️ Bot kanalda <b>admin</b> bo'lishi kerak!",
         reply_markup=back_kb("admin_panel"),
         parse_mode="HTML"
     )
@@ -1250,18 +1121,14 @@ async def process_channel_link(message: Message, state: FSMContext):
     auto_name  = None
     link       = None
 
-    # 1. Forward qilingan xabar (maxfiy kanal uchun eng ishonchli usul)
+    # 1. Forward qilingan xabar
     if message.forward_from_chat:
         chat       = message.forward_from_chat
         channel_id = str(chat.id)
         auto_name  = chat.title or "Kanal"
-        try:
-            invite = await bot.create_chat_invite_link(
-                int(channel_id),
-                creates_join_request=True
-            )
-            link = invite.invite_link
-        except Exception:
+        if chat.username:
+            link = f"https://t.me/{chat.username}"
+        else:
             link = f"https://t.me/c/{channel_id.lstrip('-100')}"
 
     # 2. t.me/+ link (maxfiy kanal)
@@ -1273,14 +1140,7 @@ async def process_channel_link(message: Message, state: FSMContext):
             chat       = await bot.get_chat(raw)
             channel_id = str(chat.id)
             auto_name  = chat.title or "Maxfiy kanal"
-            try:
-                invite = await bot.create_chat_invite_link(
-                    int(channel_id),
-                    creates_join_request=True
-                )
-                link = invite.invite_link
-            except Exception:
-                link = raw
+            link       = raw
         except Exception as e:
             logger.warning(f"t.me/+ link xato: {e}")
             await message.answer(
@@ -1300,13 +1160,9 @@ async def process_channel_link(message: Message, state: FSMContext):
             chat       = await bot.get_chat(int(raw))
             channel_id = str(chat.id)
             auto_name  = chat.title or raw
-            try:
-                invite = await bot.create_chat_invite_link(
-                    int(channel_id),
-                    creates_join_request=True
-                )
-                link = invite.invite_link
-            except Exception:
+            if chat.username:
+                link = f"https://t.me/{chat.username}"
+            else:
                 link = f"https://t.me/c/{channel_id.lstrip('-100')}"
         except Exception:
             await message.answer(
@@ -1359,19 +1215,13 @@ async def process_channel_link(message: Message, state: FSMContext):
         return
 
     await add_channel(channel_id, auto_name, link)
-    # join_request_link ni ham bazaga yoz
-    await channels.update_one(
-        {"channel_id": channel_id},
-        {"$set": {"join_request_link": link}}
-    )
     await admin_log(ADMIN_ID, "add_channel", f"id={channel_id}, name={auto_name}")
     await state.clear()
     await message.answer(
         f"✅ <b>Kanal qo'shildi!</b>\n\n"
         f"📢 {auto_name}\n"
         f"🔗 {link}\n"
-        f"🆔 <code>{channel_id}</code>\n\n"
-        f"✅ Join request rejimi ishlaydi!",
+        f"🆔 <code>{channel_id}</code>",
         reply_markup=admin_keyboard(),
         parse_mode="HTML"
     )
@@ -1735,19 +1585,6 @@ async def process_broadcast(message: Message, state: FSMContext):
     await message.answer("🏠 Admin panel:", reply_markup=admin_keyboard())
 
 
-# ===================== ADMIN DEBUG =====================
-
-@router.message(F.text == "/checkdb")
-async def check_db(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    chs = await channels.find().to_list(100)
-    text = "Channels in DB:\n"
-    for c in chs:
-        text += f"ID: `{c['channel_id']}`\nNom: {c['channel_name']}\nLink: {c.get('join_request_link', 'yo`q')}\n\n"
-    await message.answer(text, parse_mode="Markdown")
-
-
 # ===================== AUTO CHECK =====================
 
 async def auto_check_subscriptions():
@@ -1763,14 +1600,13 @@ async def auto_check_subscriptions():
                     for ch in chs:
                         channel_id_str = ch["channel_id"]
                         channel_name   = ch["channel_name"]
-                        is_member      = await is_member_or_pending(channel_id_str, user_id)
+                        ok             = await is_member(channel_id_str, user_id)
                         bonus_doc      = await channel_bonus.find_one({
                             "user_id": user_id, "channel_id": channel_id_str
                         })
-                        if not is_member and bonus_doc:
+                        if not ok and bonus_doc:
                             given           = float(bonus_doc.get("stars_given", sub_stars))
                             await channel_bonus.delete_one({"user_id": user_id, "channel_id": channel_id_str})
-                            await pending_joins.delete_one({"user_id": user_id, "channel_id": channel_id_str})
                             current_balance = await get_balance(user_id)
                             deduct_amount   = min(given, current_balance)
                             if deduct_amount > 0:
