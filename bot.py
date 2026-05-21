@@ -39,7 +39,7 @@ client = AsyncIOMotorClient(
     connectTimeoutMS=10000,
     socketTimeoutMS=10000,
 )
-mdb = client[DB_NAME]  # <-- TO'G'RI: database nomi aniq ko'rsatilgan
+mdb = client[DB_NAME]
 
 users            = mdb["users"]
 channels         = mdb["channels"]
@@ -61,7 +61,6 @@ async def init_db():
         logger.critical(f"❌ MongoDB ulanishda xato: {e}")
         raise
 
-    # Default sozlamalar (agar yo'q bo'lsa)
     await settings_col.update_one(
         {"key": "referral_stars"},
         {"$setOnInsert": {"key": "referral_stars", "value": "0.25"}},
@@ -73,7 +72,6 @@ async def init_db():
         upsert=True
     )
 
-    # Indekslar
     await users.create_index("user_id", unique=True)
     await channels.create_index("channel_id", unique=True)
     await transactions.create_index("user_id")
@@ -286,6 +284,23 @@ async def update_support_cooldown(user_id: int):
     )
 
 
+async def check_subscription(user_id: int):
+    chs = await get_channels()
+    if not chs:
+        return True, []
+    not_subbed = []
+    for ch in chs:
+        try:
+            cid    = int(ch["channel_id"])
+            member = await bot.get_chat_member(cid, user_id)
+            if member.status in ["left", "kicked", "banned"]:
+                not_subbed.append(ch)
+        except Exception as e:
+            logger.warning(f"Kanal tekshirishda xato {ch['channel_id']}: {e}")
+            not_subbed.append(ch)
+    return len(not_subbed) == 0, not_subbed
+
+
 # ===================== GIFTS =====================
 GIFTS = [
     {"emoji": "💝", "name": "Heart",   "stars": 15},
@@ -374,18 +389,6 @@ async def gifts_keyboard(user_balance: float) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-async def channels_keyboard() -> InlineKeyboardMarkup:
-    chs = await get_channels()
-    buttons = []
-    for ch in chs:
-        buttons.append([InlineKeyboardButton(
-            text=f"📢 {ch['channel_name']}", url=ch["channel_link"]
-        )])
-    buttons.append([InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_sub")])
-    buttons.append([InlineKeyboardButton(text="🔙 Ortga", callback_data="back_main")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
 def back_kb(cb: str = "back_main") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Ortga", callback_data=cb)]
@@ -420,21 +423,65 @@ async def resolve_channel(link_or_username: str):
         return None, None
 
 
-async def check_subscription(user_id: int):
+# ===================== CHANNELS RENDER HELPER =====================
+async def render_channels_menu(user_id: int, message) -> None:
+    """
+    Har bir kanalning obuna holatini alohida tekshirib,
+    ✅/❌ belgisi bilan tugma chiqaradi.
+    Xabarni edit_text orqali yangilaydi.
+    """
     chs = await get_channels()
-    if not chs:
-        return True, []
-    not_subbed = []
+    sub_stars = await get_setting("subscribe_stars") or "0.10"
+    buttons = []
+
     for ch in chs:
+        # Obuna holatini tekshirish
         try:
-            cid    = int(ch["channel_id"])
+            cid = int(ch["channel_id"])
             member = await bot.get_chat_member(cid, user_id)
-            if member.status in ["left", "kicked", "banned"]:
-                not_subbed.append(ch)
-        except Exception as e:
-            logger.warning(f"Kanal tekshirishda xato {ch['channel_id']}: {e}")
-            not_subbed.append(ch)
-    return len(not_subbed) == 0, not_subbed
+            is_member = member.status not in ["left", "kicked", "banned"]
+        except Exception:
+            is_member = False
+
+        # Bonus olganmi?
+        bonus_doc = await channel_bonus.find_one({
+            "user_id": user_id,
+            "channel_id": ch["channel_id"]
+        })
+
+        if is_member:
+            # Obuna bo'lgan
+            if bonus_doc:
+                icon = "✅"
+                note = " — bonus olindi"
+            else:
+                # Obuna bo'lgan lekin bonus olinmagan (masalan, bot qo'shilishidan oldin obuna bo'lgan)
+                icon = "✅"
+                note = " — tekshiring!"
+        else:
+            icon = "❌"
+            note = " — obuna bo'lmagansiz"
+
+        buttons.append([InlineKeyboardButton(
+            text=f"{icon} {ch['channel_name']}{note}",
+            url=ch["channel_link"]
+        )])
+
+    buttons.append([InlineKeyboardButton(
+        text="🔄 Tekshirish / Yangilash",
+        callback_data="check_sub"
+    )])
+    buttons.append([InlineKeyboardButton(text="🔙 Ortga", callback_data="back_main")])
+
+    await message.edit_text(
+        f"📢 <b>Kanallarga obuna bo'ling</b>\n\n"
+        f"Har bir kanal uchun: <b>+{sub_stars}⭐</b>\n\n"
+        f"✅ = Obuna bo'lgansiz\n"
+        f"❌ = Obuna bo'lmagansiz\n\n"
+        f"Obuna bo'lib <b>🔄 Tekshirish</b> ni bosing 👇",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
+    )
 
 
 # ===================== HANDLERS =====================
@@ -584,20 +631,17 @@ async def show_transactions(call: CallbackQuery):
     await call.answer()
 
 
+# ===================== CHANNELS (yangilangan) =====================
+
 @router.callback_query(F.data == "channels")
 async def show_channels(call: CallbackQuery):
     chs = await get_channels()
     if not chs:
         await call.answer("Hozircha kanallar yo'q!", show_alert=True)
         return
-    sub_stars = await get_setting("subscribe_stars") or "0.10"
-    await call.message.edit_text(
-        f"📢 <b>Kanallarga obuna bo'ling</b>\n\n"
-        f"Har bir kanal uchun: <b>+{sub_stars}⭐</b>\n\n"
-        f"Kanallarga obuna bo'lib tekshiring 👇",
-        reply_markup=await channels_keyboard(), parse_mode="HTML"
-    )
     await call.answer()
+    # render_channels_menu har bir kanalga alohida obuna holatini ko'rsatadi
+    await render_channels_menu(call.from_user.id, call.message)
 
 
 @router.callback_query(F.data == "check_sub")
@@ -608,21 +652,22 @@ async def check_sub(call: CallbackQuery):
         await call.answer("Hozircha kanallar yo'q!", show_alert=True)
         return
 
-    sub_stars  = float(await get_setting("subscribe_stars") or 0.10)
-    earned     = 0.0
-    lost       = 0.0
-    error_chs  = []
+    sub_stars = float(await get_setting("subscribe_stars") or 0.10)
+    results   = []   # har bir kanal natijasi
+    earned    = 0.0
+    lost      = 0.0
 
     for ch in chs:
         channel_id_str = ch["channel_id"]
         channel_name   = ch["channel_name"]
+
         try:
             cid       = int(channel_id_str)
             member    = await bot.get_chat_member(cid, user_id)
             is_member = member.status not in ["left", "kicked", "banned"]
         except Exception as e:
             logger.warning(f"Kanal tekshirishda xato {channel_id_str}: {e}")
-            error_chs.append(channel_name)
+            results.append(f"⚠️ {channel_name} — tekshirib bo'lmadi")
             continue
 
         bonus_doc = await channel_bonus.find_one({
@@ -631,6 +676,7 @@ async def check_sub(call: CallbackQuery):
         })
 
         if is_member and not bonus_doc:
+            # Yangi obuna — bonus berish
             try:
                 await channel_bonus.insert_one({
                     "user_id": user_id,
@@ -639,17 +685,24 @@ async def check_sub(call: CallbackQuery):
                 })
                 await add_balance(user_id, sub_stars, f"Kanal obuna bonusi: {channel_name}")
                 earned += sub_stars
+                results.append(f"✅ {channel_name} — +{sub_stars}⭐ qo'shildi!")
             except Exception:
-                pass  # duplicate key bo'lsa o'tkazib yuborish
+                # duplicate key — allaqachon bor
+                results.append(f"✅ {channel_name} — obuna bo'lgansiz")
+
+        elif is_member and bonus_doc:
+            # Allaqachon bonus olingan
+            results.append(f"✅ {channel_name} — bonus oldin olingan")
 
         elif not is_member and bonus_doc:
+            # Kanaldan chiqib ketgan — balans ayirish
             given = float(bonus_doc.get("stars_given", sub_stars))
             await channel_bonus.delete_one({
                 "user_id": user_id,
                 "channel_id": channel_id_str
             })
             current_balance = await get_balance(user_id)
-            deduct_amount = min(given, current_balance)
+            deduct_amount   = min(given, current_balance)
             if deduct_amount > 0:
                 await users.update_one(
                     {"user_id": user_id},
@@ -663,20 +716,30 @@ async def check_sub(call: CallbackQuery):
                     "created_at": datetime.utcnow()
                 })
                 lost += deduct_amount
+                results.append(f"❌ {channel_name} — -{round(deduct_amount, 2)}⭐ ayirildi")
+            else:
+                results.append(f"❌ {channel_name} — obuna bo'lmagansiz")
+
+        else:
+            # Obuna yo'q, bonus ham yo'q
+            results.append(f"❌ {channel_name} — obuna bo'lmagansiz")
 
     balance = await get_balance(user_id)
-    parts   = []
+    summary = ""
     if earned > 0:
-        parts.append(f"✅ +{round(earned, 2)}⭐ qo'shildi!")
+        summary += f"\n\n➕ Jami qo'shildi: +{round(earned, 2)}⭐"
     if lost > 0:
-        parts.append(f"❌ -{round(lost, 2)}⭐ qaytarildi (kanaldan chiqqansiz)")
-    if error_chs:
-        parts.append(f"⚠️ Tekshirib bo'lmadi: {', '.join(error_chs)}")
-    if not parts:
-        parts.append("ℹ️ O'zgarish yo'q.")
-    parts.append(f"💰 Balans: {balance}⭐")
-    await call.answer("\n".join(parts), show_alert=True)
+        summary += f"\n➖ Jami ayirildi: -{round(lost, 2)}⭐"
+    summary += f"\n💰 Balans: {balance}⭐"
 
+    # Alert ko'rsatish
+    await call.answer("\n".join(results) + summary, show_alert=True)
+
+    # Sahifani yangilash — holatlar o'zgargan bo'lishi mumkin
+    await render_channels_menu(user_id, call.message)
+
+
+# ===================== SUPPORT =====================
 
 @router.callback_query(F.data == "support")
 async def support_menu(call: CallbackQuery):
@@ -744,6 +807,8 @@ async def process_support_message(message: Message, state: FSMContext):
         parse_mode="HTML"
     )
 
+
+# ===================== GIFT =====================
 
 @router.callback_query(F.data == "buy_gift")
 async def buy_gift_menu(call: CallbackQuery):
@@ -1272,9 +1337,9 @@ async def process_broadcast(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     await state.clear()
-    user_ids   = await get_all_user_ids()
+    user_ids     = await get_all_user_ids()
     sent, failed = 0, 0
-    status_msg = await message.answer(f"📣 Yuborilmoqda... 0/{len(user_ids)}")
+    status_msg   = await message.answer(f"📣 Yuborilmoqda... 0/{len(user_ids)}")
     for i, uid in enumerate(user_ids):
         try:
             await bot.send_message(uid, f"📣 {message.text}", parse_mode="HTML")
@@ -1299,7 +1364,6 @@ async def process_broadcast(message: Message, state: FSMContext):
 # ===================== AUTO CHECK SUBSCRIPTIONS =====================
 async def auto_check_subscriptions():
     """Har 6 soatda barcha foydalanuvchilarni tekshiradi."""
-    # Birinchi ishga tushganda 10 soniya kuting
     await asyncio.sleep(10)
     while True:
         logger.info("🔄 Avtomatik obuna tekshiruvi boshlandi...")
@@ -1362,7 +1426,6 @@ async def main():
     await init_db()
     dp.include_router(router)
 
-    # Health check server
     async def health(request):
         return web.Response(text="OK")
 
@@ -1375,7 +1438,6 @@ async def main():
     await site.start()
     logger.info(f"✅ Web server port {port} da ishga tushdi!")
 
-    # Background task
     asyncio.create_task(auto_check_subscriptions())
 
     logger.info("✅ Bot ishga tushdi!")
