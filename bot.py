@@ -516,14 +516,7 @@ async def handle_join_request(update: ChatJoinRequest):
 # ===================== HANDLERS =====================
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
-    await state.clear()
-    user_id   = message.from_user.id
-    username  = message.from_user.username or ""
-    full_name = message.from_user.full_name or ""
-    args      = message.text.split()
-
-    is_new      = (await get_user(user_id)) is async def render_channels_menu(user_id: int, message) -> None:
+async def render_channels_menu(user_id: int, message) -> None:
     chs       = await get_channels()
     sub_stars = await get_setting("subscribe_stars") or "0.10"
 
@@ -537,27 +530,27 @@ async def cmd_start(message: Message, state: FSMContext):
     buttons = []
     for ch in chs:
         channel_id_str = ch["channel_id"]
-        is_joined      = await pending_joins.find_one({
+
+        bonus_doc = await channel_bonus.find_one({
             "user_id": user_id,
             "channel_id": channel_id_str
         })
-        icon = "✅" if is_joined else "❌"
+        icon = "✅" if bonus_doc else "❌"
 
         # Har safar yangi join request link yarat
         try:
             invite = await bot.create_chat_invite_link(
                 int(channel_id_str),
-                creates_join_request=True,
-                # expire_date=None — muddatsiz
+                creates_join_request=True
             )
             link = invite.invite_link
         except Exception:
-            link = ch["channel_link"]  # fallback
+            link = ch["channel_link"]
 
         buttons.append([
             InlineKeyboardButton(
                 text=f"{icon} {ch['channel_name']}",
-                url=link  # yangi link
+                url=link
             ),
             InlineKeyboardButton(
                 text="🔄 Tekshirish",
@@ -574,74 +567,13 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.edit_text(
         f"📢 <b>Kanallarga obuna bo'ling</b>\n\n"
         f"Har bir kanal uchun: <b>+{sub_stars}⭐</b>\n\n"
-        f"✅ = Join request yuborgansiz\n"
-        f"❌ = Yubormagansiz\n\n"
-        f"Kanal nomiga bosib join request yuboring,\n"
+        f"✅ = Bonus olindi\n"
+        f"❌ = Hali bonus olinmagan\n\n"
+        f"Kanal nomiga bosib Join Request yuboring,\n"
         f"keyin <b>🔄 Tekshirish</b> tugmasini bosing 👇",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode="HTML"
-    )None
-    referred_by = None
-
-    if len(args) > 1:
-        try:
-            ref_id = int(args[1])
-            if ref_id != user_id and is_new:
-                referrer = await get_user(ref_id)
-                if referrer:
-                    referred_by = ref_id
-        except Exception:
-            pass
-
-    await add_user(user_id, username, full_name, referred_by)
-
-    if is_new and referred_by:
-        if await check_referral_abuse(referred_by):
-            ref_stars = float(await get_setting("referral_stars") or 0.25)
-            await add_balance(referred_by, ref_stars, f"Referral: {full_name}")
-            await users.update_one(
-                {"user_id": referred_by},
-                {"$inc": {"referral_count": 1}}
-            )
-            try:
-                await bot.send_message(
-                    referred_by,
-                    f"🎉 Do'stingiz <b>{full_name}</b> botga qo'shildi!\n"
-                    f"➕ Hisobingizga <b>+{ref_stars}⭐</b> qo'shildi!",
-                    parse_mode="HTML"
-                )
-            except Exception:
-                pass
-        else:
-            try:
-                await bot.send_message(
-                    ADMIN_ID,
-                    f"⚠️ <b>Shubhali referral faoliyat!</b>\n\n"
-                    f"Referrer ID: <code>{referred_by}</code>\n"
-                    f"1 soatda 5+ yangi foydalanuvchi. Stars berilmadi.",
-                    parse_mode="HTML"
-                )
-            except Exception:
-                pass
-
-    balance   = await get_balance(user_id)
-    ref_stars = await get_setting("referral_stars") or "0.25"
-    sub_stars = await get_setting("subscribe_stars") or "0.10"
-
-    await message.answer(
-        f"⭐ <b>Stars Gift Bot</b> ga xush kelibsiz!\n\n"
-        f"💰 Balansingiz: <b>{balance}⭐</b>\n\n"
-        f"📌 <b>Qanday ishlaydi?</b>\n"
-        f"• Do'stingizni taklif qiling → <b>+{ref_stars}⭐</b>\n"
-        f"• Kanallarga obuna bo'ling → <b>+{sub_stars}⭐</b>\n"
-        f"• Stars to'plab 🎁 Gift oling!\n\n"
-        f"⏰ <b>Muhim:</b> Gift olish faqat <b>har kuni soat 20:00 — 00:00</b> da ishlaydi!\n"
-        f"👥 <b>Gift olish uchun kamida {MIN_REFERRALS_FOR_GIFT} ta do'st taklif qiling!</b>\n\n"
-        f"Quyidagi menyu orqali boshqaring 👇",
-        reply_markup=main_menu(user_id),
-        parse_mode="HTML"
     )
-
 
 @router.callback_query(F.data == "work_hours")
 async def work_hours_info(call: CallbackQuery):
