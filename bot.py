@@ -1121,9 +1121,9 @@ async def process_channel_link(message: Message, state: FSMContext):
     auto_name  = None
     link       = None
 
-    # 1. Forward qilingan xabar
-    if message.forward_from_chat:
-        chat       = message.forward_from_chat
+    # 1. Forward qilingan xabar (aiogram v3)
+    if message.forward_origin and hasattr(message.forward_origin, 'chat'):
+        chat       = message.forward_origin.chat
         channel_id = str(chat.id)
         auto_name  = chat.title or "Kanal"
         if chat.username:
@@ -1131,67 +1131,32 @@ async def process_channel_link(message: Message, state: FSMContext):
         else:
             link = f"https://t.me/c/{channel_id.lstrip('-100')}"
 
-    # 2. t.me/+ link (maxfiy kanal)
-    elif message.text and "t.me/+" in message.text:
-        raw = message.text.strip()
-        if "t.me/+" in raw:
-            raw = "https://t.me/+" + raw.split("t.me/+")[-1].split()[0]
-        try:
-            chat       = await bot.get_chat(raw)
-            channel_id = str(chat.id)
-            auto_name  = chat.title or "Maxfiy kanal"
-            link       = raw
-        except Exception as e:
-            logger.warning(f"t.me/+ link xato: {e}")
-            await message.answer(
-                "❌ <b>Kanal topilmadi!</b>\n\n"
-                "Bot kanalda <b>admin</b> bo'lishi kerak!\n"
-                "Kanalga botni admin qilib, qayta urinib ko'ring.",
-                reply_markup=back_kb("admin_panel"),
-                parse_mode="HTML"
-            )
-            await state.clear()
-            return
-
-    # 3. Kanal ID raqam
-    elif message.text and message.text.strip().lstrip("-").isdigit():
-        raw = message.text.strip()
-        try:
-            chat       = await bot.get_chat(int(raw))
-            channel_id = str(chat.id)
-            auto_name  = chat.title or raw
-            if chat.username:
-                link = f"https://t.me/{chat.username}"
-            else:
-                link = f"https://t.me/c/{channel_id.lstrip('-100')}"
-        except Exception:
-            await message.answer(
-                "❌ <b>Kanal topilmadi!</b>\n\nBot kanalda admin bo'lishi kerak!",
-                reply_markup=back_kb("admin_panel"),
-                parse_mode="HTML"
-            )
-            await state.clear()
-            return
-
-    # 4. @username yoki t.me/username (public kanal)
+    # 2. @username yoki kanal ID
     elif message.text:
         raw = message.text.strip()
-        if "t.me/" in raw and "t.me/+" not in raw:
-            part     = raw.split("t.me/")[-1].split("/")[0]
-            username = "@" + part
+        
+        if raw.lstrip("-").isdigit():
+            username = int(raw)
         elif raw.startswith("@"):
             username = raw
+        elif "t.me/" in raw and "t.me/+" not in raw:
+            part     = raw.split("t.me/")[-1].split("/")[0]
+            username = "@" + part
         else:
-            username = "@" + raw
+            username = "@" + raw.lstrip("@")
 
         try:
             chat       = await bot.get_chat(username)
             channel_id = str(chat.id)
-            auto_name  = chat.title or username
-            link       = f"https://t.me/{username.lstrip('@')}"
+            auto_name  = chat.title or str(username)
+            if chat.username:
+                link = f"https://t.me/{chat.username}"
+            else:
+                link = f"https://t.me/c/{str(chat.id).lstrip('-100')}"
         except Exception:
             await message.answer(
-                "❌ <b>Kanal topilmadi!</b>",
+                "❌ <b>Kanal topilmadi!</b>\n\n"
+                "Maxfiy kanal uchun kanaldan xabar <b>forward</b> qiling 👇",
                 reply_markup=back_kb("admin_panel"),
                 parse_mode="HTML"
             )
@@ -1206,11 +1171,7 @@ async def process_channel_link(message: Message, state: FSMContext):
         return
 
     if not channel_id:
-        await message.answer(
-            "❌ <b>Kanal topilmadi!</b>",
-            reply_markup=back_kb("admin_panel"),
-            parse_mode="HTML"
-        )
+        await message.answer("❌ <b>Kanal topilmadi!</b>", reply_markup=back_kb("admin_panel"), parse_mode="HTML")
         await state.clear()
         return
 
@@ -1225,7 +1186,6 @@ async def process_channel_link(message: Message, state: FSMContext):
         reply_markup=admin_keyboard(),
         parse_mode="HTML"
     )
-
 
 @router.callback_query(F.data == "admin_remove_channel")
 async def admin_remove_channel_handler(call: CallbackQuery):
