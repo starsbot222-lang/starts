@@ -1736,7 +1736,15 @@ async def auto_check_subscriptions():
         logger.info("✅ Tekshiruv tugadi.")
         await asyncio.sleep(2 * 2600)
 
-
+@router.message(F.text == "/checkdb")
+async def check_db(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    chs = await channels.find().to_list(100)
+    text = "Channels in DB:\n"
+    for c in chs:
+        text += f"ID: `{c['channel_id']}`\nNom: {c['channel_name']}\n\n"
+    await message.answer(text, parse_mode="Markdown")
 # ===================== MAIN =====================
 async def main():
     await init_db()
