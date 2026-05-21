@@ -1111,82 +1111,7 @@ async def admin_add_channel_start(call: CallbackQuery, state: FSMContext):
     )
     await call.answer()
 
-
-@router.message(AdminStates.add_channel_link)
-async def process_channel_link(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    channel_id = None
-    auto_name  = None
-    link       = None
-
-    # 1. Forward qilingan xabar (aiogram v3)
-    if message.forward_origin and hasattr(message.forward_origin, 'chat'):
-        chat       = message.forward_origin.chat
-        channel_id = str(chat.id)
-        auto_name  = chat.title or "Kanal"
-        if chat.username:
-            link = f"https://t.me/{chat.username}"
-        else:
-            link = f"https://t.me/c/{channel_id.lstrip('-100')}"
-
-    # 2. @username yoki kanal ID
-    elif message.text:
-        raw = message.text.strip()
-        
-        if raw.lstrip("-").isdigit():
-            username = int(raw)
-        elif raw.startswith("@"):
-            username = raw
-        elif "t.me/" in raw and "t.me/+" not in raw:
-            part     = raw.split("t.me/")[-1].split("/")[0]
-            username = "@" + part
-        else:
-            username = "@" + raw.lstrip("@")
-
-        try:
-            chat       = await bot.get_chat(username)
-            channel_id = str(chat.id)
-            auto_name  = chat.title or str(username)
-            if chat.username:
-                link = f"https://t.me/{chat.username}"
-            else:
-                link = f"https://t.me/c/{str(chat.id).lstrip('-100')}"
-        except Exception:
-            await message.answer(
-                "❌ <b>Kanal topilmadi!</b>\n\n"
-                "Maxfiy kanal uchun kanaldan xabar <b>forward</b> qiling 👇",
-                reply_markup=back_kb("admin_panel"),
-                parse_mode="HTML"
-            )
-            await state.clear()
-            return
-    else:
-        await message.answer(
-            "❌ Tushunmadim!\n\nKanaldan xabar <b>forward</b> qiling 👇",
-            reply_markup=back_kb("admin_panel"),
-            parse_mode="HTML"
-        )
-        return
-
-    if not channel_id:
-        await message.answer("❌ <b>Kanal topilmadi!</b>", reply_markup=back_kb("admin_panel"), parse_mode="HTML")
-        await state.clear()
-        return
-
-    await add_channel(channel_id, auto_name, link)
-    await admin_log(ADMIN_ID, "add_channel", f"id={channel_id}, name={auto_name}")
-    await state.clear()
-    await message.answer(
-        f"✅ <b>Kanal qo'shildi!</b>\n\n"
-        f"📢 {auto_name}\n"
-        f"🔗 {link}\n"
-        f"🆔 <code>{channel_id}</code>",
-        reply_markup=admin_keyboard(),
-        parse_mode="HTML"
-    )
-
+v
 @router.callback_query(F.data == "admin_remove_channel")
 async def admin_remove_channel_handler(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
@@ -1415,7 +1340,7 @@ async def show_users_page(message, top_list: list, page: int, edit: bool = True)
     end      = min(start + per_page, total)
     chunk    = top_list[start:end]
 
-    text = f"👥 <b>Top {total} foydalanuvchi ({start+1}–{end}):</b>\n\n"
+    text = f"👥 <b>Top {total} foydalanuvchi ({start+1}–{end}):</b>\n\n"x`
     for i, u in enumerate(chunk, start + 1):
         uname = f"@{u['username']}" if u.get("username") else u.get("full_name", "Noma'lum")
         bal   = round(u.get("balance", 0), 2)
