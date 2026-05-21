@@ -478,27 +478,24 @@ async def render_channels_menu(user_id: int, message) -> None:
             "channel_id": ch["channel_id"]
         })
 
-        if is_member:
-            if bonus_doc:
-                icon = "✅"
-                note = " — bonus olindi"
-            else:
-                icon = "✅"
-                note = " — tekshiring!"
+        if is_member and bonus_doc:
+            icon = "✅"
+        elif is_member and not bonus_doc:
+            icon = "✅"
         else:
             icon = "❌"
-            note = " — obuna bo'lmagansiz"
 
-        # Kanal havolasi tugmasi
-        buttons.append([InlineKeyboardButton(
-            text=f"{icon} {ch['channel_name']}{note}",
-            url=ch["channel_link"]
-        )])
-        # Har kanal uchun alohida "Tekshirish" tugmasi
-        buttons.append([InlineKeyboardButton(
-            text=f"🔄 {ch['channel_name']} ni tekshirish",
-            callback_data=f"checksub_{ch['channel_id']}"
-        )])
+        # Kanal va tekshirish tugmasi YONMA-YON (bir qatorda)
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{icon} {ch['channel_name']}",
+                url=ch["channel_link"]
+            ),
+            InlineKeyboardButton(
+                text="🔄 Tekshirish",
+                callback_data=f"checksub_{ch['channel_id']}"
+            )
+        ])
 
     buttons.append([InlineKeyboardButton(
         text="🔄 Hammasini tekshirish",
@@ -511,13 +508,11 @@ async def render_channels_menu(user_id: int, message) -> None:
         f"Har bir kanal uchun: <b>+{sub_stars}⭐</b>\n\n"
         f"✅ = Obuna bo'lgansiz\n"
         f"❌ = Obuna bo'lmagansiz\n\n"
-        f"Har bir kanal uchun alohida tekshirish yoki\n"
-        f"<b>🔄 Hammasini tekshirish</b> ni bosing 👇",
+        f"Kanal nomiga bosib obuna bo'ling,\n"
+        f"keyin <b>🔄 Tekshirish</b> tugmasini bosing 👇",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode="HTML"
     )
-
-
 # ===================== HANDLERS =====================
 
 @router.message(CommandStart())
