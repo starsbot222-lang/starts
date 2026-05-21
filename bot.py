@@ -551,6 +551,7 @@ async def render_channels_menu(user_id: int, message) -> None:
         f"✅ = Obuna bo'lgansiz\n"
         f"❌ = Obuna bo'lmagansiz\n\n"
         f"Kanal nomiga bosib obuna bo'ling,\n"
+        f"Obunadan so'ng 5 soniya kutib keyingisiga o'ting\n"
         f"keyin <b>🔄 Tekshirish</b> tugmasini bosing 👇",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode="HTML"
