@@ -1100,17 +1100,16 @@ async def admin_add_channel_start(call: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.add_channel_link)
     await call.message.edit_text(
         "➕ <b>Kanal qo'shish</b>\n\n"
-        "Quyidagilardan birini yuboring:\n\n"
-        "1️⃣ <code>https://t.me/+xxxxxx</code> (maxfiy kanal linki)\n"
-        "2️⃣ Kanaldan istalgan xabarni <b>forward qiling</b>\n"
-        "3️⃣ <code>@kanalname</code> (public kanal)\n"
-        "4️⃣ Kanal ID raqami\n\n"
+        "1-qadam: Kanal invite linkini yuboring\n"
+        "<code>https://t.me/+xxxxxxxxxx</code>\n\n"
+        "2-qadam: Kanal ID sini yuboring\n"
+        "<code>-1003928551808</code>\n\n"
+        "⚠️ Kanalda <b>Approve new members</b> yoqilgan bo'lsin!\n"
         "⚠️ Bot kanalda <b>admin</b> bo'lishi kerak!",
         reply_markup=back_kb("admin_panel"),
         parse_mode="HTML"
     )
     await call.answer()
-
 v
 @router.callback_query(F.data == "admin_remove_channel")
 async def admin_remove_channel_handler(call: CallbackQuery):
