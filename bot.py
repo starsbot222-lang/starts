@@ -16,6 +16,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 # ===================== SOZLAMALAR =====================
 BOT_TOKEN     = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
@@ -61,6 +62,7 @@ async def init_db():
         logger.critical(f"❌ MongoDB ulanishda xato: {e}")
         raise
 
+    # Default sozlamalar
     await settings_col.update_one(
         {"key": "referral_stars"},
         {"$setOnInsert": {"key": "referral_stars", "value": "0.25"}},
@@ -72,6 +74,7 @@ async def init_db():
         upsert=True
     )
 
+    # Indekslar
     await users.create_index("user_id", unique=True)
     await channels.create_index("channel_id", unique=True)
     await transactions.create_index("user_id")
@@ -80,6 +83,11 @@ async def init_db():
     await orders.create_index("created_at")
     await channel_bonus.create_index(
         [("user_id", 1), ("channel_id", 1)], unique=True
+    )
+    # FIX #7: referral_hourly TTL indeks — 24 soatdan keyin avtomatik o'chadi
+    await referral_hourly.create_index(
+        "created_at",
+        expireAfterSeconds=86400
     )
     logger.info("✅ Indekslar tayyor!")
 
@@ -148,14 +156,18 @@ async def add_balance(user_id: int, amount: float, desc: str = ""):
     })
 
 
+# FIX #2: atomic update — race condition yo'q
 async def deduct_balance(user_id: int, amount: float, desc: str = "") -> bool:
-    user = await users.find_one({"user_id": user_id})
-    if not user or round(user.get("balance", 0), 10) < amount:
-        return False
-    await users.update_one(
-        {"user_id": user_id},
-        {"$inc": {"balance": -amount}}
+    result = await users.find_one_and_update(
+        {
+            "user_id": user_id,
+            "balance": {"$gte": amount}   # shart MongoDB ichida atomik tekshiriladi
+        },
+        {"$inc": {"balance": -amount}},
+        return_document=ReturnDocument.AFTER
     )
+    if not result:
+        return False
     await transactions.insert_one({
         "user_id": user_id,
         "amount": amount,
@@ -238,11 +250,15 @@ async def get_pending_orders():
     return await orders.find({"status": "pending"}).sort("created_at", 1).to_list(length=100)
 
 
+# FIX #7: created_at qo'shildi — TTL indeks ishlashi uchun
 async def check_referral_abuse(referred_by: int) -> bool:
     hour_key = datetime.now(TIMEZONE).strftime("%Y%m%d%H")
     doc = await referral_hourly.find_one_and_update(
         {"referrer_id": referred_by, "hour_key": hour_key},
-        {"$inc": {"count": 1}},
+        {
+            "$inc": {"count": 1},
+            "$setOnInsert": {"created_at": datetime.utcnow()}
+        },
         upsert=True,
         return_document=ReturnDocument.AFTER
     )
@@ -424,16 +440,23 @@ async def resolve_channel(link_or_username: str):
 
 
 # ===================== CHANNELS RENDER HELPER =====================
+# FIX #4: chs bo'sh bo'lsa ham xavfsiz ishlaydi
 async def render_channels_menu(user_id: int, message) -> None:
     """
     Har bir kanalning obuna holatini alohida tekshirib,
     ✅/❌ belgisi bilan tugma chiqaradi.
-    Xabarni edit_text orqali yangilaydi.
     """
     chs = await get_channels()
     sub_stars = await get_setting("subscribe_stars") or "0.10"
-    buttons = []
 
+    if not chs:
+        await message.edit_text(
+            "📢 Hozircha kanallar yo'q.",
+            reply_markup=back_kb()
+        )
+        return
+
+    buttons = []
     for ch in chs:
         # Obuna holatini tekshirish
         try:
@@ -450,12 +473,10 @@ async def render_channels_menu(user_id: int, message) -> None:
         })
 
         if is_member:
-            # Obuna bo'lgan
             if bonus_doc:
                 icon = "✅"
                 note = " — bonus olindi"
             else:
-                # Obuna bo'lgan lekin bonus olinmagan (masalan, bot qo'shilishidan oldin obuna bo'lgan)
                 icon = "✅"
                 note = " — tekshiring!"
         else:
@@ -631,7 +652,7 @@ async def show_transactions(call: CallbackQuery):
     await call.answer()
 
 
-# ===================== CHANNELS (yangilangan) =====================
+# ===================== CHANNELS =====================
 
 @router.callback_query(F.data == "channels")
 async def show_channels(call: CallbackQuery):
@@ -640,7 +661,6 @@ async def show_channels(call: CallbackQuery):
         await call.answer("Hozircha kanallar yo'q!", show_alert=True)
         return
     await call.answer()
-    # render_channels_menu har bir kanalga alohida obuna holatini ko'rsatadi
     await render_channels_menu(call.from_user.id, call.message)
 
 
@@ -653,7 +673,7 @@ async def check_sub(call: CallbackQuery):
         return
 
     sub_stars = float(await get_setting("subscribe_stars") or 0.10)
-    results   = []   # har bir kanal natijasi
+    results   = []
     earned    = 0.0
     lost      = 0.0
 
@@ -676,22 +696,26 @@ async def check_sub(call: CallbackQuery):
         })
 
         if is_member and not bonus_doc:
-            # Yangi obuna — bonus berish
+            # FIX #3: avval insert, muvaffaqiyatli bo'lsagina balance qo'shiladi
+            # DuplicateKeyError aniq ushlanadi — boshqa xatolar logga tushadi
             try:
                 await channel_bonus.insert_one({
                     "user_id": user_id,
                     "channel_id": channel_id_str,
                     "stars_given": sub_stars
                 })
+                # Insert muvaffaqiyatli — balance qo'shish xavfsiz
                 await add_balance(user_id, sub_stars, f"Kanal obuna bonusi: {channel_name}")
                 earned += sub_stars
                 results.append(f"✅ {channel_name} — +{sub_stars}⭐ qo'shildi!")
-            except Exception:
-                # duplicate key — allaqachon bor
-                results.append(f"✅ {channel_name} — obuna bo'lgansiz")
+            except DuplicateKeyError:
+                # Parallel so'rov — allaqachon qo'shilgan, balance emas
+                results.append(f"✅ {channel_name} — bonus oldin olingan")
+            except Exception as e:
+                logger.error(f"Bonus qo'shishda xato {channel_name}: {e}")
+                results.append(f"⚠️ {channel_name} — xato yuz berdi")
 
         elif is_member and bonus_doc:
-            # Allaqachon bonus olingan
             results.append(f"✅ {channel_name} — bonus oldin olingan")
 
         elif not is_member and bonus_doc:
@@ -704,24 +728,17 @@ async def check_sub(call: CallbackQuery):
             current_balance = await get_balance(user_id)
             deduct_amount   = min(given, current_balance)
             if deduct_amount > 0:
-                await users.update_one(
-                    {"user_id": user_id},
-                    {"$inc": {"balance": -deduct_amount}}
+                # FIX #2: atomic deduct ishlatiladi
+                await deduct_balance(
+                    user_id, deduct_amount,
+                    f"Kanal tark etildi: {channel_name}"
                 )
-                await transactions.insert_one({
-                    "user_id": user_id,
-                    "amount": deduct_amount,
-                    "type": "debit",
-                    "description": f"Kanal tark etildi: {channel_name}",
-                    "created_at": datetime.utcnow()
-                })
                 lost += deduct_amount
                 results.append(f"❌ {channel_name} — -{round(deduct_amount, 2)}⭐ ayirildi")
             else:
                 results.append(f"❌ {channel_name} — obuna bo'lmagansiz")
 
         else:
-            # Obuna yo'q, bonus ham yo'q
             results.append(f"❌ {channel_name} — obuna bo'lmagansiz")
 
     balance = await get_balance(user_id)
@@ -732,10 +749,7 @@ async def check_sub(call: CallbackQuery):
         summary += f"\n➖ Jami ayirildi: -{round(lost, 2)}⭐"
     summary += f"\n💰 Balans: {balance}⭐"
 
-    # Alert ko'rsatish
     await call.answer("\n".join(results) + summary, show_alert=True)
-
-    # Sahifani yangilash — holatlar o'zgargan bo'lishi mumkin
     await render_channels_menu(user_id, call.message)
 
 
@@ -894,10 +908,13 @@ async def confirm_gift(call: CallbackQuery):
     username  = user.get("username") or ""
     full_name = user.get("full_name") or ""
     uname     = f"@{username}" if username else full_name
+
+    # FIX #2: atomic deduct ishlatiladi
     ok = await deduct_balance(user_id, gift["stars"], f"Gift buyurtma: {gift['name']}")
     if not ok:
         await call.answer("❌ Stars yetarli emas!", show_alert=True)
         return
+
     order_id = await add_order(
         user_id, username, full_name,
         gift["name"], gift["emoji"], gift["stars"]
@@ -915,13 +932,16 @@ async def confirm_gift(call: CallbackQuery):
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(
                     text="✅ Bajarildi",
-                    callback_data=f"done_order_{order_id}_{user_id}"
+                    # FIX #1: order_id va user_id ni ishonchli ajratish uchun
+                    # format: "done_order|ORDER_ID|USER_ID" — | belgisi ObjectId da yo'q
+                    callback_data=f"done_order|{order_id}|{user_id}"
                 )]
             ]),
             parse_mode="HTML"
         )
     except Exception as e:
         logger.error(f"Admin xabar yuborishda xato: {e}")
+
     new_balance = await get_balance(user_id)
     await call.message.edit_text(
         f"✅ <b>Buyurtmangiz qabul qilindi!</b>\n\n"
@@ -933,14 +953,20 @@ async def confirm_gift(call: CallbackQuery):
     await call.answer()
 
 
-@router.callback_query(F.data.startswith("done_order_"))
+# FIX #1: done_order — "|" separator ishlatiladi, _ emas
+@router.callback_query(F.data.startswith("done_order|"))
 async def done_order(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         await call.answer("❌ Ruxsat yo'q!", show_alert=True)
         return
-    parts    = call.data.split("_")
-    order_id = parts[2]
-    user_id  = int(parts[3])
+    try:
+        # "done_order|ORDER_ID|USER_ID" — xavfsiz parse
+        _, order_id, user_id_str = call.data.split("|")
+        user_id = int(user_id_str)
+    except Exception:
+        await call.answer("❌ Noto'g'ri format!", show_alert=True)
+        return
+
     await complete_order(order_id)
     await admin_log(ADMIN_ID, "complete_order", f"order_id={order_id}, user_id={user_id}")
     try:
@@ -1007,7 +1033,8 @@ async def admin_orders_handler(call: CallbackQuery):
         text += f"{uname} — {o['gift_emoji']} {o['gift_name']} ({o['gift_stars']}⭐)\n"
         buttons.append([InlineKeyboardButton(
             text=f"✅ {uname} — {o['gift_emoji']} {o['gift_stars']}⭐",
-            callback_data=f"done_order_{oid}_{o['user_id']}"
+            # FIX #1: "|" separator
+            callback_data=f"done_order|{oid}|{o['user_id']}"
         )])
     buttons.append([InlineKeyboardButton(text="🔙 Ortga", callback_data="admin_panel")])
     await call.message.edit_text(
@@ -1332,6 +1359,7 @@ async def admin_broadcast(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
+# FIX #6: HTML xatosi bo'lsa oddiy matn bilan qayta yuboriladi
 @router.message(AdminStates.broadcast)
 async def process_broadcast(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
@@ -1345,7 +1373,12 @@ async def process_broadcast(message: Message, state: FSMContext):
             await bot.send_message(uid, f"📣 {message.text}", parse_mode="HTML")
             sent += 1
         except Exception:
-            failed += 1
+            try:
+                # HTML xatosi bo'lsa parse_mode'siz yuborish
+                await bot.send_message(uid, f"📣 {message.text}")
+                sent += 1
+            except Exception:
+                failed += 1
         if (i + 1) % 50 == 0:
             try:
                 await status_msg.edit_text(
@@ -1362,6 +1395,7 @@ async def process_broadcast(message: Message, state: FSMContext):
 
 
 # ===================== AUTO CHECK SUBSCRIPTIONS =====================
+# FIX #5: sleep 0.1s — rate limit xavfsiz
 async def auto_check_subscriptions():
     """Har 6 soatda barcha foydalanuvchilarni tekshiradi."""
     await asyncio.sleep(10)
@@ -1396,17 +1430,11 @@ async def auto_check_subscriptions():
                         current_balance = await get_balance(user_id)
                         deduct_amount   = min(given, current_balance)
                         if deduct_amount > 0:
-                            await users.update_one(
-                                {"user_id": user_id},
-                                {"$inc": {"balance": -deduct_amount}}
+                            # FIX #2: atomic deduct
+                            await deduct_balance(
+                                user_id, deduct_amount,
+                                f"Kanal tark etildi (auto): {channel_name}"
                             )
-                            await transactions.insert_one({
-                                "user_id": user_id,
-                                "amount": deduct_amount,
-                                "type": "debit",
-                                "description": f"Kanal tark etildi (auto): {channel_name}",
-                                "created_at": datetime.utcnow()
-                            })
                             try:
                                 await bot.send_message(
                                     user_id,
@@ -1416,7 +1444,8 @@ async def auto_check_subscriptions():
                                 )
                             except Exception:
                                 pass
-                    await asyncio.sleep(0.05)
+                    # FIX #5: 0.05 o'rniga 0.1 — Telegram rate limit uchun xavfsiz
+                    await asyncio.sleep(0.1)
         logger.info("✅ Avtomatik tekshiruv tugadi.")
         await asyncio.sleep(6 * 3600)  # 6 soat
 
