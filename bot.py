@@ -1,16 +1,20 @@
 import asyncio
+import json
 import logging
 import os
-from datetime import datetime
+import secrets
+from datetime import datetime, timezone
 import pytz
 
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import CommandStart
+from typing import Callable, Dict, Any, Awaitable
+from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ChatJoinRequest,
+    ChatJoinRequest, TelegramObject,
 )
+from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramNotFound
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -30,6 +34,15 @@ DB_NAME       = os.environ.get("DB_NAME", "starsbot")
 
 MIN_REFERRALS_FOR_GIFT = 3  # default, DB dan o'qiladi
 # ======================================================
+
+
+def ensure_utc(dt: datetime) -> datetime:
+    """MongoDB dan kelgan naive datetime larni UTC ga o'tkazadi."""
+    if dt is None:
+        return datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,10 +65,13 @@ settings_col     = mdb["settings"]
 transactions     = mdb["transactions"]
 orders           = mdb["orders"]
 admin_logs       = mdb["admin_logs"]
-referral_hourly  = mdb["referral_hourly"]
+referral_hourly   = mdb["referral_hourly"]
+referral_minute   = mdb["referral_minute"]
 support_cooldown  = mdb["support_cooldown"]
 channel_bonus     = mdb["user_channel_bonus"]
 join_requests_col = mdb["join_requests"]
+exchange_orders   = mdb["exchange_orders"]
+transfers_col     = mdb["transfers"]
 
 
 async def init_db():
@@ -81,6 +97,18 @@ async def init_db():
         {"$setOnInsert": {"key": "min_referrals", "value": "3"}},
         upsert=True
     )
+    _uzs_default  = json.dumps([[50,25000],[100,50000],[200,100000],[300,150000],[500,250000]])
+    _pubg_default = json.dumps([[15,5],[30,10],[60,25],[120,50],[240,100]])
+    await settings_col.update_one(
+        {"key": "uzs_variants"},
+        {"$setOnInsert": {"key": "uzs_variants", "value": _uzs_default}},
+        upsert=True
+    )
+    await settings_col.update_one(
+        {"key": "pubg_variants"},
+        {"$setOnInsert": {"key": "pubg_variants", "value": _pubg_default}},
+        upsert=True
+    )
 
     await users.create_index("user_id", unique=True)
     await channels.create_index("channel_id", unique=True)
@@ -95,6 +123,11 @@ async def init_db():
         "created_at",
         expireAfterSeconds=86400
     )
+    await referral_minute.create_index(
+        "created_at",
+        expireAfterSeconds=60
+    )
+    await users.create_index("is_banned")
     await support_cooldown.create_index(
         "last_sent_at",
         expireAfterSeconds=7200
@@ -102,6 +135,11 @@ async def init_db():
     await join_requests_col.create_index(
         [("user_id", 1), ("channel_id", 1)], unique=True
     )
+    await exchange_orders.create_index("user_id")
+    await exchange_orders.create_index("status")
+    await exchange_orders.create_index("created_at")
+    await transfers_col.create_index("token", unique=True)
+    await transfers_col.create_index("from_user_id")
     logger.info("✅ Indekslar tayyor!")
 
 
@@ -130,7 +168,7 @@ async def admin_log(admin_id: int, action: str, details: str = ""):
         "admin_id": admin_id,
         "action": action,
         "details": details,
-        "created_at": datetime.utcnow()
+        "created_at": datetime.now(timezone.utc)
     })
 
 
@@ -152,7 +190,7 @@ async def add_user(user_id: int, username: str, full_name: str, referred_by=None
                 "referred_by": referred_by,
                 "referral_count": 0,
                 "last_order_time": None,
-                "joined_at": datetime.utcnow()
+                "joined_at": datetime.now(timezone.utc)
             }
         },
         upsert=True
@@ -169,7 +207,7 @@ async def add_balance(user_id: int, amount: float, desc: str = ""):
         "amount": amount,
         "type": "credit",
         "description": desc,
-        "created_at": datetime.utcnow()
+        "created_at": datetime.now(timezone.utc)
     })
 
 
@@ -186,7 +224,7 @@ async def deduct_balance(user_id: int, amount: float, desc: str = "") -> bool:
         "amount": amount,
         "type": "debit",
         "description": desc,
-        "created_at": datetime.utcnow()
+        "created_at": datetime.now(timezone.utc)
     })
     return True
 
@@ -242,13 +280,14 @@ async def add_order(user_id, username, full_name, gift_name, gift_emoji, gift_st
         "gift_emoji": gift_emoji,
         "gift_stars": gift_stars,
         "status": "pending",
-        "created_at": datetime.utcnow()
+        "created_at": datetime.now(timezone.utc)
     })
     await users.update_one(
         {"user_id": user_id},
-        {"$set": {"last_order_time": datetime.utcnow()}}
+        {"$set": {"last_order_time": datetime.now(timezone.utc)}}
     )
-    return str(result.inserted_id)
+    order_id = str(result.inserted_id)
+    return order_id
 
 
 async def complete_order(order_id: str):
@@ -262,13 +301,66 @@ async def get_pending_orders():
     return await orders.find({"status": "pending"}).sort("created_at", 1).to_list(length=100)
 
 
+async def is_banned(user_id: int) -> bool:
+    user = await users.find_one({"user_id": user_id})
+    return bool(user and user.get("is_banned"))
+
+
+async def ban_user(user_id: int, reason: str = ""):
+    await users.update_one(
+        {"user_id": user_id},
+        {"$set": {"is_banned": True, "ban_reason": reason}}
+    )
+    await admin_logs.insert_one({
+        "admin_id": 0,
+        "action": "auto_ban",
+        "details": f"user_id={user_id}, reason={reason}",
+        "created_at": datetime.now(timezone.utc)
+    })
+    logger.warning(f"🚫 User {user_id} banned: {reason}")
+
+
+async def unban_user(user_id: int):
+    await users.update_one(
+        {"user_id": user_id},
+        {"$set": {"is_banned": False, "ban_reason": ""}}
+    )
+
+
 async def check_referral_abuse(referred_by: int) -> bool:
+    # 1 daqiqada 15 dan ortiq referral → ban
+    minute_key = datetime.now(TIMEZONE).strftime("%Y%m%d%H%M")
+    min_doc = await referral_minute.find_one_and_update(
+        {"referrer_id": referred_by, "minute_key": minute_key},
+        {
+            "$inc": {"count": 1},
+            "$setOnInsert": {"created_at": datetime.now(timezone.utc)}
+        },
+        upsert=True,
+        return_document=ReturnDocument.AFTER
+    )
+    if min_doc["count"] > 15:
+        await ban_user(referred_by, "1 daqiqada 15+ referral spam")
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"🚫 <b>Spam aniqlandi!</b>\n\n"
+                f"👤 User: <code>{referred_by}</code>\n"
+                f"⚡ 1 daqiqada <b>{min_doc['count']} ta</b> referral yubordi\n"
+                f"🔒 Avtomatik ban qilindi!",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+        return False
+
+    # Soatiga 5 dan ortiq referral → rad etish (ban emas)
     hour_key = datetime.now(TIMEZONE).strftime("%Y%m%d%H")
     doc = await referral_hourly.find_one_and_update(
         {"referrer_id": referred_by, "hour_key": hour_key},
         {
             "$inc": {"count": 1},
-            "$setOnInsert": {"created_at": datetime.utcnow()}
+            "$setOnInsert": {"created_at": datetime.now(timezone.utc)}
         },
         upsert=True,
         return_document=ReturnDocument.AFTER
@@ -282,7 +374,7 @@ async def check_order_cooldown(user_id: int) -> bool:
         return True
     try:
         last = user["last_order_time"]
-        diff = (datetime.utcnow() - last).total_seconds()
+        diff = (datetime.now(timezone.utc) - ensure_utc(last)).total_seconds()
         return diff >= 15
     except Exception:
         return True
@@ -294,7 +386,7 @@ async def check_support_cooldown(user_id: int):
         return True, 0
     try:
         last = doc["last_sent_at"]
-        diff = (datetime.utcnow() - last).total_seconds()
+        diff = (datetime.now(timezone.utc) - ensure_utc(last)).total_seconds()
         if diff >= 3600:
             return True, 0
         minutes_left = int((3600 - diff) / 60) + 1
@@ -306,7 +398,7 @@ async def check_support_cooldown(user_id: int):
 async def update_support_cooldown(user_id: int):
     await support_cooldown.update_one(
         {"user_id": user_id},
-        {"$set": {"last_sent_at": datetime.utcnow()}},
+        {"$set": {"last_sent_at": datetime.now(timezone.utc)}},
         upsert=True
     )
 
@@ -348,6 +440,99 @@ async def get_referral_count(user_id: int) -> int:
     return user.get("referral_count", 0) if user else 0
 
 
+async def get_variants(vtype: str) -> list:
+    doc = await settings_col.find_one({"key": f"{vtype}_variants"})
+    if not doc:
+        return []
+    try:
+        return json.loads(doc["value"])
+    except Exception:
+        return []
+
+
+async def set_variant_slot(vtype: str, slot: int, stars: int, amount: float):
+    variants = await get_variants(vtype)
+    while len(variants) <= slot:
+        variants.append([0, 0])
+    variants[slot] = [stars, round(amount, 2)]
+    await settings_col.update_one(
+        {"key": f"{vtype}_variants"},
+        {"$set": {"value": json.dumps(variants)}},
+        upsert=True
+    )
+
+
+async def add_exchange_order(
+    user_id: int, username: str, full_name: str,
+    order_type: str, stars: int, amount: float,
+    detail1: str, detail2: str
+) -> str:
+    result = await exchange_orders.insert_one({
+        "type": order_type,
+        "user_id": user_id,
+        "username": username,
+        "full_name": full_name,
+        "stars": stars,
+        "amount": amount,
+        "detail1": detail1,
+        "detail2": detail2,
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc)
+    })
+    order_id = str(result.inserted_id)
+    return order_id
+
+
+async def complete_exchange_order(order_id: str):
+    await exchange_orders.update_one(
+        {"_id": ObjectId(order_id)},
+        {"$set": {"status": "done"}}
+    )
+
+
+async def create_transfer(from_user_id: int, amount: float) -> str:
+    token = secrets.token_hex(6)  # 12 belgili
+    await transfers_col.insert_one({
+        "token": token,
+        "from_user_id": from_user_id,
+        "amount": amount,
+        "net_amount": round(amount * 0.95, 2),
+        "commission": round(amount * 0.05, 2),
+        "status": "pending",
+        "to_user_id": None,
+        "created_at": datetime.now(timezone.utc)
+    })
+    return token
+
+
+async def get_transfer(token: str):
+    return await transfers_col.find_one({"token": token})
+
+
+async def use_transfer(token: str, to_user_id: int) -> bool:
+    result = await transfers_col.find_one_and_update(
+        {"token": token, "status": "pending"},
+        {"$set": {"status": "used", "to_user_id": to_user_id, "used_at": datetime.now(timezone.utc)}},
+        return_document=ReturnDocument.AFTER
+    )
+    return result is not None
+
+
+async def cancel_transfer(token: str, from_user_id: int) -> bool:
+    result = await transfers_col.find_one_and_update(
+        {"token": token, "from_user_id": from_user_id, "status": "pending"},
+        {"$set": {"status": "cancelled"}},
+        return_document=ReturnDocument.AFTER
+    )
+    return result is not None
+
+
+async def get_pending_exchange_orders():
+    return await exchange_orders.find(
+        {"status": "pending"}
+    ).sort("created_at", 1).to_list(length=100)
+
+
 # ===================== GIFTS =====================
 GIFTS = [
     {"emoji": "💝", "name": "Heart",   "stars": 15},
@@ -370,13 +555,22 @@ class AdminStates(StatesGroup):
     set_referral_stars   = State()
     set_subscribe_stars  = State()
     set_min_referrals    = State()
+    set_uzs_variant      = State()
+    set_pubg_variant     = State()
     broadcast            = State()
     add_balance_input    = State()
     deduct_balance_input = State()
+    search_user          = State()
+    send_user_msg        = State()
 
 
 class UserStates(StatesGroup):
-    support_message = State()
+    support_message   = State()
+    uzs_card          = State()
+    uzs_card_name     = State()
+    pubg_id           = State()
+    pubg_nick         = State()
+    transfer_amount   = State()
 
 
 # ===================== BOT & ROUTER =====================
@@ -385,6 +579,28 @@ dp     = Dispatcher(storage=MemoryStorage())
 router = Router()
 
 _users_cache: list = []
+
+
+# ===================== BAN MIDDLEWARE =====================
+
+class BanMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        user = data.get("event_from_user")
+        if user and user.id != ADMIN_ID:
+            banned = await is_banned(user.id)
+            if banned:
+                if hasattr(event, "answer"):
+                    try:
+                        await event.answer("🚫 Siz botdan bloklangansiz.")
+                    except Exception:
+                        pass
+                return
+        return await handler(event, data)
 
 
 # ===================== KLAVIATURALAR =====================
@@ -396,9 +612,18 @@ def main_menu(user_id: int) -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton(text="🎁 Gift olish",       callback_data="buy_gift")],
         [InlineKeyboardButton(text="📢 Kanallarga obuna", callback_data="channels")],
+        [
+            InlineKeyboardButton(text="💵 So'mga almashtirish", callback_data="exchange_uzs"),
+            InlineKeyboardButton(text="🎮 PUBG UC",             callback_data="exchange_pubg"),
+        ],
         [InlineKeyboardButton(text="📋 Transaksiyalar",   callback_data="transactions")],
+        [
+            InlineKeyboardButton(text="🏆 Reyting",        callback_data="leaderboard"),
+            InlineKeyboardButton(text="💸 Stars uzatish",  callback_data="transfer_menu"),
+        ],
         [InlineKeyboardButton(text="⏰ Ish vaqti",        callback_data="work_hours")],
         [InlineKeyboardButton(text="🆘 Yordam / Muammo", callback_data="support")],
+        [InlineKeyboardButton(text="ℹ️ Bot haqida",      callback_data="about")],
     ]
     if user_id == ADMIN_ID:
         buttons.append([InlineKeyboardButton(text="🔧 Admin panel", callback_data="admin_panel")])
@@ -414,10 +639,15 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="👥 Min referral sozla",   callback_data="admin_set_min_refs")],
         [InlineKeyboardButton(text="💰 Balans qo'shish",      callback_data="admin_add_balance")],
         [InlineKeyboardButton(text="💸 Balans ayirish",       callback_data="admin_deduct_balance")],
-        [InlineKeyboardButton(text="📦 Buyurtmalar",          callback_data="admin_orders")],
+        [InlineKeyboardButton(text="📦 Gift buyurtmalar",       callback_data="admin_orders")],
+        [InlineKeyboardButton(text="💱 Almashtirish buyurtmalari", callback_data="admin_exc_orders")],
+        [InlineKeyboardButton(text="💵 UZS variantlari",       callback_data="admin_uzs_config")],
+        [InlineKeyboardButton(text="🎮 PUBG variantlari",      callback_data="admin_pubg_config")],
+        [InlineKeyboardButton(text="🔍 Foydalanuvchi qidirish", callback_data="admin_search_user")],
         [InlineKeyboardButton(text="📊 Statistika",           callback_data="admin_stats")],
         [InlineKeyboardButton(text="📣 Xabar yuborish",       callback_data="admin_broadcast")],
         [InlineKeyboardButton(text="👥 Foydalanuvchilar",     callback_data="admin_users")],
+        [InlineKeyboardButton(text="🚫 Banlangan userlar",    callback_data="admin_banned")],
         [InlineKeyboardButton(text="🔙 Ortga",                callback_data="back_main")],
     ])
 
@@ -517,7 +747,7 @@ async def on_join_request(event: ChatJoinRequest):
     try:
         await join_requests_col.update_one(
             {"user_id": user_id, "channel_id": channel_id_str},
-            {"$set": {"created_at": datetime.utcnow()}},
+            {"$set": {"created_at": datetime.now(timezone.utc)}},
             upsert=True
         )
         logger.info(f"Join request saqlandi: user={user_id}, channel={channel_id_str}")
@@ -533,15 +763,24 @@ async def cmd_start(message: Message):
     username  = message.from_user.username or ""
     full_name = message.from_user.full_name or ""
 
+    if await is_banned(user_id):
+        await message.answer("🚫 Siz botdan bloklangansiz. Muammo bo'lsa admin bilan bog'laning.")
+        return
+
     args = message.text.split()
     referred_by = None
+    transfer_token = None
     if len(args) > 1:
-        try:
-            ref_id = int(args[1])
-            if ref_id != user_id:
-                referred_by = ref_id
-        except ValueError:
-            pass
+        arg = args[1]
+        if arg.startswith("tr_"):
+            transfer_token = arg[3:]
+        else:
+            try:
+                ref_id = int(arg)
+                if ref_id != user_id:
+                    referred_by = ref_id
+            except ValueError:
+                pass
 
     existing = await get_user(user_id)
     await add_user(user_id, username, full_name, referred_by)
@@ -565,6 +804,33 @@ async def cmd_start(message: Message):
             except Exception:
                 pass
 
+    if transfer_token:
+        tr = await get_transfer(transfer_token)
+        if tr is None or tr["status"] != "pending":
+            await message.answer(
+                "❌ Bu transfer havolasi yaroqsiz yoki allaqachon ishlatilgan.",
+                parse_mode="HTML"
+            )
+        elif tr["from_user_id"] == user_id:
+            await message.answer(
+                "❌ O'z transferingizni qabul qila olmaysiz.",
+                parse_mode="HTML"
+            )
+        else:
+            net = tr["net_amount"]
+            await message.answer(
+                f"💸 <b>Stars Transfer</b>\n\n"
+                f"Sizga <b>{tr['amount']}⭐</b> jo'natilgan.\n"
+                f"5% komissiyadan so'ng: <b>{net}⭐</b>\n\n"
+                f"Qabul qilasizmi?",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="✅ Qabul qilish", callback_data=f"tr_accept_{transfer_token}"),
+                    InlineKeyboardButton(text="❌ Rad etish",   callback_data="back_main"),
+                ]]),
+                parse_mode="HTML"
+            )
+        return
+
     balance   = await get_balance(user_id)
     ref_stars = await get_setting("referral_stars") or "0.25"
     sub_stars = await get_setting("subscribe_stars") or "0.10"
@@ -584,6 +850,251 @@ async def cmd_start(message: Message):
 
 
 # ===================== WORK HOURS =====================
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    current = await state.get_state()
+    await state.clear()
+    if current:
+        await message.answer("❌ Bekor qilindi.", reply_markup=main_menu(message.from_user.id), parse_mode="HTML")
+    else:
+        await message.answer("🏠 Bosh sahifa:", reply_markup=main_menu(message.from_user.id), parse_mode="HTML")
+
+
+@router.callback_query(F.data == "about")
+async def about_handler(call: CallbackQuery):
+    ref_stars = await get_setting("referral_stars") or "0.25"
+    sub_stars = await get_setting("subscribe_stars") or "0.10"
+    min_refs  = await get_min_referrals()
+    await call.message.edit_text(
+        f"ℹ️ <b>Stars Gift Bot haqida</b>\n\n"
+        f"Bu bot orqali bepul ⭐ Stars yig'ib, Telegram Gift va boshqa mukofotlarga almashtirishingiz mumkin!\n\n"
+        f"<b>Qanday ishlaydi?</b>\n"
+        f"👥 Do'st taklif qiling → <b>+{ref_stars}⭐</b>\n"
+        f"📢 Kanallarga obuna bo'ling → <b>+{sub_stars}⭐</b>\n"
+        f"⭐ Stars yig'ing → kerakli miqdorga yeting\n\n"
+        f"<b>Nimalarga almashtirasiz?</b>\n"
+        f"🎁 Telegram Gift (15⭐ dan)\n"
+        f"💵 O'zbek so'mi (UZS) — kartaga\n"
+        f"🎮 PUBG UC — ID orqali\n\n"
+        f"<b>Shartlar:</b>\n"
+        f"👥 Gift uchun kamida <b>{min_refs} ta referral</b>\n"
+        f"⏰ Gift vaqti: <b>20:00 — 00:00</b>\n"
+        f"🔒 Spam qilganda avtomatik ban\n\n"
+        f"<b>Qo'llab-quvvatlash:</b>\n"
+        f"💬 {SUPPORT_GROUP}",
+        reply_markup=back_kb(), parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "leaderboard")
+async def leaderboard_handler(call: CallbackQuery):
+    top = await users.find(
+        {"is_banned": {"$ne": True}}
+    ).sort("referral_count", -1).limit(10).to_list(10)
+
+    if not top:
+        await call.answer("Hali ma'lumot yo'q.", show_alert=True)
+        return
+
+    lines = ["🏆 <b>TOP-10 Referral Reytingi</b>\n"]
+    medals = ["🥇", "🥈", "🥉"] + ["4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+    for i, u in enumerate(top):
+        name  = u.get("full_name") or u.get("username") or f"User {u['user_id']}"
+        count = u.get("referral_count", 0)
+        lines.append(f"{medals[i]} <b>{name}</b> — {count} ta referral")
+
+    await call.message.edit_text(
+        "\n".join(lines),
+        reply_markup=back_kb(),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+# ===================== P2P TRANSFER =====================
+
+@router.callback_query(F.data == "transfer_menu")
+async def transfer_menu(call: CallbackQuery):
+    balance = await get_balance(call.from_user.id)
+    await call.message.edit_text(
+        f"💸 <b>Stars Uzatish (P2P)</b>\n\n"
+        f"💰 Balansingiz: <b>{balance}⭐</b>\n\n"
+        f"Do'stingizga Stars yuboring.\n"
+        f"• 5% komissiya olinadi\n"
+        f"• Minimal miqdor: <b>10⭐</b>\n"
+        f"• Havola 24 soat amal qiladi\n\n"
+        f"Necha yulduz jo'natmoqchisiz?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="10⭐",  callback_data="tr_quick_10"),
+                InlineKeyboardButton(text="25⭐",  callback_data="tr_quick_25"),
+                InlineKeyboardButton(text="50⭐",  callback_data="tr_quick_50"),
+            ],
+            [
+                InlineKeyboardButton(text="100⭐", callback_data="tr_quick_100"),
+                InlineKeyboardButton(text="200⭐", callback_data="tr_quick_200"),
+                InlineKeyboardButton(text="500⭐", callback_data="tr_quick_500"),
+            ],
+            [InlineKeyboardButton(text="✏️ Boshqa miqdor", callback_data="tr_custom")],
+            [InlineKeyboardButton(text="🔙 Ortga",         callback_data="back_main")],
+        ]),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "tr_custom")
+async def transfer_custom(call: CallbackQuery, state: FSMContext):
+    await state.set_state(UserStates.transfer_amount)
+    await call.message.edit_text(
+        "✏️ Miqdorni kiriting (kamida 10⭐):\n\n<i>Bekor qilish: /cancel</i>",
+        reply_markup=back_kb(),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("tr_quick_"))
+async def transfer_quick(call: CallbackQuery):
+    try:
+        amount = float(call.data.split("_")[2])
+    except (IndexError, ValueError):
+        await call.answer("Xato!", show_alert=True)
+        return
+    await _process_transfer_create(call.message, call.from_user.id, amount, edit=True)
+    await call.answer()
+
+
+@router.message(UserStates.transfer_amount)
+async def transfer_amount_input(message: Message, state: FSMContext):
+    try:
+        amount = float(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Raqam kiriting. Masalan: 50")
+        return
+    if amount < 10:
+        await message.answer("❌ Minimal miqdor 10⭐.")
+        return
+    await state.clear()
+    await _process_transfer_create(message, message.from_user.id, amount, edit=False)
+
+
+async def _process_transfer_create(msg, user_id: int, amount: float, edit: bool):
+    balance = await get_balance(user_id)
+    if balance < amount:
+        text = f"❌ Balansingiz yetarli emas.\n💰 Balans: <b>{balance}⭐</b>, kerak: <b>{amount}⭐</b>"
+        if edit:
+            await msg.edit_text(text, reply_markup=back_kb(), parse_mode="HTML")
+        else:
+            await msg.answer(text, reply_markup=back_kb(), parse_mode="HTML")
+        return
+
+    net = round(amount * 0.95, 2)
+    commission = round(amount * 0.05, 2)
+
+    ok = await deduct_balance(user_id, amount, f"Transfer yaratildi: -{amount}⭐")
+    if not ok:
+        text = "❌ Balansni ayirishda xato. Qayta urinib ko'ring."
+        if edit:
+            await msg.edit_text(text, reply_markup=back_kb(), parse_mode="HTML")
+        else:
+            await msg.answer(text, reply_markup=back_kb(), parse_mode="HTML")
+        return
+
+    token = await create_transfer(user_id, amount)
+    bot_info = await bot.get_me()
+    link = f"https://t.me/{bot_info.username}?start=tr_{token}"
+
+    text = (
+        f"✅ <b>Transfer havolasi yaratildi!</b>\n\n"
+        f"💸 Jo'natildi: <b>{amount}⭐</b>\n"
+        f"🤝 Do'stingiz oladi: <b>{net}⭐</b>\n"
+        f"📊 Komissiya: <b>{commission}⭐</b>\n\n"
+        f"🔗 Havola:\n<code>{link}</code>\n\n"
+        f"<i>Havola 24 soat amal qiladi. Agar ishlatilmasa, /cancel_tr_{token} buyrug'i bilan bekor qilishingiz mumkin.</i>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data=f"tr_cancel_{token}")],
+        [InlineKeyboardButton(text="🏠 Bosh sahifa",  callback_data="back_main")],
+    ])
+    if edit:
+        await msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await msg.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("tr_accept_"))
+async def transfer_accept(call: CallbackQuery):
+    token = call.data[len("tr_accept_"):]
+    to_user_id = call.from_user.id
+
+    tr = await get_transfer(token)
+    if tr is None or tr["status"] != "pending":
+        await call.answer("❌ Transfer yaroqsiz yoki allaqachon ishlatilgan.", show_alert=True)
+        return
+    if tr["from_user_id"] == to_user_id:
+        await call.answer("❌ O'z transferingizni qabul qila olmaysiz.", show_alert=True)
+        return
+
+    ok = await use_transfer(token, to_user_id)
+    if not ok:
+        await call.answer("❌ Transfer ishlatib bo'lindi.", show_alert=True)
+        return
+
+    net = tr["net_amount"]
+    await add_balance(to_user_id, net, f"Transfer qabul qilindi: +{net}⭐")
+
+    try:
+        await bot.send_message(
+            tr["from_user_id"],
+            f"✅ Transferingiz qabul qilindi!\n"
+            f"💸 <b>{tr['amount']}⭐</b> jo'natildi.",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+    await call.message.edit_text(
+        f"✅ <b>Qabul qilindi!</b>\n\n"
+        f"💰 Hisobingizga <b>+{net}⭐</b> qo'shildi.",
+        reply_markup=back_kb(),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("tr_cancel_"))
+async def transfer_cancel(call: CallbackQuery):
+    token = call.data[len("tr_cancel_"):]
+    user_id = call.from_user.id
+
+    tr = await get_transfer(token)
+    if tr is None:
+        await call.answer("❌ Transfer topilmadi.", show_alert=True)
+        return
+    if tr["from_user_id"] != user_id:
+        await call.answer("❌ Bu sizning transferingiz emas.", show_alert=True)
+        return
+    if tr["status"] != "pending":
+        await call.answer("❌ Bu transfer allaqachon tugagan.", show_alert=True)
+        return
+
+    ok = await cancel_transfer(token, user_id)
+    if not ok:
+        await call.answer("❌ Bekor qilishda xato.", show_alert=True)
+        return
+
+    await add_balance(user_id, tr["amount"], f"Transfer bekor qilindi: +{tr['amount']}⭐")
+    await call.message.edit_text(
+        f"✅ Transfer bekor qilindi.\n"
+        f"💰 <b>+{tr['amount']}⭐</b> qaytarildi.",
+        reply_markup=back_kb(),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
 
 @router.callback_query(F.data == "work_hours")
 async def work_hours_info(call: CallbackQuery):
@@ -807,9 +1318,10 @@ async def support_menu(call: CallbackQuery):
         f"Muammo yoki savolingizni yozing, admin tez orada javob beradi.\n\n"
         f"💬 Guruhimiz: {SUPPORT_GROUP}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✏️ Xabar yozish",  callback_data="support_write")],
-            [InlineKeyboardButton(text="💬 Guruhga o'tish", url=SUPPORT_GROUP)],
-            [InlineKeyboardButton(text="🔙 Ortga",          callback_data="back_main")],
+            [InlineKeyboardButton(text="✏️ Xabar yozish",   callback_data="support_write")],
+            [InlineKeyboardButton(text="💬 Guruhga o'tish",  url=SUPPORT_GROUP)],
+            [InlineKeyboardButton(text="📢 Bizning kanal",   url="https://t.me/starsChannelpy")],
+            [InlineKeyboardButton(text="🔙 Ortga",           callback_data="back_main")],
         ]),
         parse_mode="HTML"
     )
@@ -1077,6 +1589,328 @@ async def done_order(call: CallbackQuery):
     await call.answer("✅ Buyurtma bajarildi!")
 
 
+# ===================== UZS EXCHANGE =====================
+
+@router.callback_query(F.data == "exchange_uzs")
+async def exchange_uzs_menu(call: CallbackQuery):
+    user_id  = call.from_user.id
+    balance  = await get_balance(user_id)
+    variants = await get_variants("uzs")
+    if not variants or all(v[0] == 0 for v in variants):
+        await call.answer("Hozircha UZS almashtirish mavjud emas!", show_alert=True)
+        return
+    buttons = []
+    for i, (stars, uzs) in enumerate(variants):
+        if stars <= 0:
+            continue
+        mark = "✅" if balance >= stars else "❌"
+        buttons.append([InlineKeyboardButton(
+            text=f"{mark} {stars}⭐ = {uzs:,} UZS",
+            callback_data=f"uzs_buy_{i}"
+        )])
+    buttons.append([InlineKeyboardButton(text="🔙 Ortga", callback_data="back_main")])
+    await call.message.edit_text(
+        f"💵 <b>Starlarni so'mga almashtirish</b>\n\n"
+        f"💰 Balansingiz: <b>{balance}⭐</b>\n\n"
+        f"✅ = Yetarli | ❌ = Stars kam\n\n"
+        f"Variantni tanlang 👇",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("uzs_buy_"))
+async def uzs_select_variant(call: CallbackQuery, state: FSMContext):
+    try:
+        slot = int(call.data.split("_")[2])
+    except (ValueError, IndexError):
+        await call.answer("❌ Xato!", show_alert=True)
+        return
+    variants = await get_variants("uzs")
+    if slot >= len(variants):
+        await call.answer("Variant topilmadi!", show_alert=True)
+        return
+    stars, uzs = variants[slot]
+    if stars <= 0:
+        await call.answer("Bu variant faol emas!", show_alert=True)
+        return
+    balance = await get_balance(call.from_user.id)
+    if balance < stars:
+        await call.answer(f"❌ Stars yetarli emas!\nKerak: {stars}⭐\nBalans: {balance}⭐", show_alert=True)
+        return
+    await state.update_data(uzs_stars=stars, uzs_amount=uzs)
+    await state.set_state(UserStates.uzs_card)
+    await call.message.edit_text(
+        f"💵 <b>{stars}⭐ → {uzs:,} UZS</b>\n\n"
+        f"Karta raqamingizni yuboring:\n"
+        f"<code>8600 XXXX XXXX XXXX</code>\n\n"
+        f"Bekor qilish: /start",
+        reply_markup=back_kb("exchange_uzs"), parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.message(UserStates.uzs_card)
+async def uzs_get_card(message: Message, state: FSMContext):
+    card = message.text.strip().replace(" ", "").replace("-", "") if message.text else ""
+    if not card.isdigit() or len(card) != 16:
+        await message.answer("❌ Karta raqami 16 ta raqamdan iborat bo'lishi kerak!\nQaytadan yuboring:")
+        return
+    formatted = f"{card[:4]} {card[4:8]} {card[8:12]} {card[12:]}"
+    await state.update_data(uzs_card=formatted)
+    await state.set_state(UserStates.uzs_card_name)
+    await message.answer(
+        f"✅ Karta: <code>{formatted}</code>\n\n"
+        f"Karta egasining ismini yuboring:\n"
+        f"<i>Masalan: ALISHER KARIMOV</i>",
+        parse_mode="HTML"
+    )
+
+
+@router.message(UserStates.uzs_card_name)
+async def uzs_get_card_name(message: Message, state: FSMContext):
+    name = message.text.strip() if message.text else ""
+    if len(name) < 3 or len(name) > 60:
+        await message.answer("❌ Ism noto'g'ri. Qaytadan yuboring:")
+        return
+    data      = await state.get_data()
+    stars     = data["uzs_stars"]
+    uzs       = data["uzs_amount"]
+    card      = data["uzs_card"]
+    user_id   = message.from_user.id
+    username  = message.from_user.username or ""
+    full_name = message.from_user.full_name or ""
+    uname     = f"@{username}" if username else full_name
+
+    ok = await deduct_balance(user_id, stars, f"UZS almashtirish: {stars}⭐ → {uzs:,} UZS")
+    if not ok:
+        await state.clear()
+        await message.answer("❌ Stars yetarli emas! Balans o'zgardi.")
+        return
+
+    order_id = await add_exchange_order(
+        user_id, username, full_name, "uzs", stars, uzs, card, name
+    )
+    await state.clear()
+
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"💵 <b>UZS almashtirish so'rovi!</b>\n\n"
+            f"🆔 Buyurtma: <code>{order_id}</code>\n"
+            f"👤 {uname} | <code>{user_id}</code>\n"
+            f"⭐ {stars}⭐ → <b>{uzs:,} UZS</b>\n"
+            f"💳 Karta: <code>{card}</code>\n"
+            f"👤 Egasi: <b>{name}</b>\n"
+            f"🕐 {datetime.now(TIMEZONE).strftime('%H:%M')}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="✅ Pul yuborildi",
+                    callback_data=f"done_exc|{order_id}|{user_id}"
+                )
+            ]]),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Admin ga UZS buyurtma yuborishda xato: {e}")
+
+    new_balance = await get_balance(user_id)
+    await message.answer(
+        f"✅ <b>So'rov qabul qilindi!</b>\n\n"
+        f"💵 <b>{stars}⭐ → {uzs:,} UZS</b>\n"
+        f"💳 {card}\n"
+        f"👤 {name}\n\n"
+        f"⏳ Admin tez orada kartangizga pul yuboradi.\n"
+        f"💰 Qolgan balans: <b>{new_balance}⭐</b>",
+        reply_markup=back_kb(), parse_mode="HTML"
+    )
+
+
+# ===================== PUBG UC EXCHANGE =====================
+
+@router.callback_query(F.data == "exchange_pubg")
+async def exchange_pubg_menu(call: CallbackQuery):
+    user_id  = call.from_user.id
+    balance  = await get_balance(user_id)
+    variants = await get_variants("pubg")
+    if not variants or all(v[0] == 0 for v in variants):
+        await call.answer("Hozircha PUBG UC mavjud emas!", show_alert=True)
+        return
+    buttons = []
+    for i, (stars, uc) in enumerate(variants):
+        if stars <= 0:
+            continue
+        mark = "✅" if balance >= stars else "❌"
+        buttons.append([InlineKeyboardButton(
+            text=f"{mark} {stars}⭐ = {uc} UC",
+            callback_data=f"pubg_buy_{i}"
+        )])
+    buttons.append([InlineKeyboardButton(text="🔙 Ortga", callback_data="back_main")])
+    await call.message.edit_text(
+        f"🎮 <b>PUBG UC sotib olish</b>\n\n"
+        f"💰 Balansingiz: <b>{balance}⭐</b>\n\n"
+        f"✅ = Yetarli | ❌ = Stars kam\n\n"
+        f"Variantni tanlang 👇",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("pubg_buy_"))
+async def pubg_select_variant(call: CallbackQuery, state: FSMContext):
+    try:
+        slot = int(call.data.split("_")[2])
+    except (ValueError, IndexError):
+        await call.answer("❌ Xato!", show_alert=True)
+        return
+    variants = await get_variants("pubg")
+    if slot >= len(variants):
+        await call.answer("Variant topilmadi!", show_alert=True)
+        return
+    stars, uc = variants[slot]
+    if stars <= 0:
+        await call.answer("Bu variant faol emas!", show_alert=True)
+        return
+    balance = await get_balance(call.from_user.id)
+    if balance < stars:
+        await call.answer(f"❌ Stars yetarli emas!\nKerak: {stars}⭐\nBalans: {balance}⭐", show_alert=True)
+        return
+    await state.update_data(pubg_stars=stars, pubg_uc=uc)
+    await state.set_state(UserStates.pubg_id)
+    await call.message.edit_text(
+        f"🎮 <b>{stars}⭐ → {uc} UC</b>\n\n"
+        f"PUBG ID raqamingizni yuboring:\n"
+        f"<i>Masalan: 5123456789</i>\n\n"
+        f"Bekor qilish: /start",
+        reply_markup=back_kb("exchange_pubg"), parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.message(UserStates.pubg_id)
+async def pubg_get_id(message: Message, state: FSMContext):
+    uid = message.text.strip() if message.text else ""
+    if not uid.isdigit() or not (5 <= len(uid) <= 15):
+        await message.answer("❌ PUBG ID faqat raqamlardan iborat bo'lishi kerak (5-15 ta)!\nQaytadan yuboring:")
+        return
+    await state.update_data(pubg_player_id=uid)
+    await state.set_state(UserStates.pubg_nick)
+    await message.answer(
+        f"✅ ID: <code>{uid}</code>\n\n"
+        f"PUBG nicknameingizni yuboring:\n"
+        f"<i>Masalan: ProPlayer123</i>",
+        parse_mode="HTML"
+    )
+
+
+@router.message(UserStates.pubg_nick)
+async def pubg_get_nick(message: Message, state: FSMContext):
+    nick = message.text.strip() if message.text else ""
+    if len(nick) < 3 or len(nick) > 30:
+        await message.answer("❌ Nickname 3-30 ta belgidan iborat bo'lishi kerak!\nQaytadan yuboring:")
+        return
+    data      = await state.get_data()
+    stars     = data["pubg_stars"]
+    uc        = data["pubg_uc"]
+    player_id = data["pubg_player_id"]
+    user_id   = message.from_user.id
+    username  = message.from_user.username or ""
+    full_name = message.from_user.full_name or ""
+    uname     = f"@{username}" if username else full_name
+
+    ok = await deduct_balance(user_id, stars, f"PUBG UC: {stars}⭐ → {uc} UC")
+    if not ok:
+        await state.clear()
+        await message.answer("❌ Stars yetarli emas! Balans o'zgardi.")
+        return
+
+    order_id = await add_exchange_order(
+        user_id, username, full_name, "pubg", stars, uc, player_id, nick
+    )
+    await state.clear()
+
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"🎮 <b>PUBG UC so'rovi!</b>\n\n"
+            f"🆔 Buyurtma: <code>{order_id}</code>\n"
+            f"👤 {uname} | <code>{user_id}</code>\n"
+            f"⭐ {stars}⭐ → <b>{uc} UC</b>\n"
+            f"🆔 PUBG ID: <code>{player_id}</code>\n"
+            f"🎮 Nickname: <b>{nick}</b>\n"
+            f"🕐 {datetime.now(TIMEZONE).strftime('%H:%M')}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="✅ UC yuborildi",
+                    callback_data=f"done_exc|{order_id}|{user_id}"
+                )
+            ]]),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Admin ga PUBG buyurtma yuborishda xato: {e}")
+
+    new_balance = await get_balance(user_id)
+    await message.answer(
+        f"✅ <b>So'rov qabul qilindi!</b>\n\n"
+        f"🎮 <b>{stars}⭐ → {uc} UC</b>\n"
+        f"🆔 PUBG ID: {player_id}\n"
+        f"🎮 Nickname: {nick}\n\n"
+        f"⏳ Admin tez orada UC yuboradi.\n"
+        f"💰 Qolgan balans: <b>{new_balance}⭐</b>",
+        reply_markup=back_kb(), parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data.startswith("done_exc|"))
+async def done_exchange(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("❌ Ruxsat yo'q!", show_alert=True)
+        return
+    try:
+        parts    = call.data.split("|")
+        order_id = parts[1]
+        user_id  = int(parts[2])
+    except Exception:
+        await call.answer("❌ Noto'g'ri format!", show_alert=True)
+        return
+
+    order = await exchange_orders.find_one({"_id": ObjectId(order_id)})
+    if not order:
+        await call.answer("Buyurtma topilmadi!", show_alert=True)
+        return
+    if order["status"] == "done":
+        await call.answer("Bu buyurtma allaqachon bajarilgan!", show_alert=True)
+        return
+
+    await complete_exchange_order(order_id)
+    await admin_log(ADMIN_ID, "complete_exchange", f"order_id={order_id}, type={order['type']}")
+
+    if order["type"] == "uzs":
+        user_msg = (
+            f"✅ <b>Pul kartangizga yuborildi!</b>\n\n"
+            f"💵 {order['stars']}⭐ → <b>{order['amount']:,} UZS</b>\n"
+            f"💳 {order['detail1']}"
+        )
+    else:
+        user_msg = (
+            f"✅ <b>PUBG UC hisobingizga yuborildi!</b>\n\n"
+            f"🎮 {order['stars']}⭐ → <b>{order['amount']} UC</b>\n"
+            f"🆔 ID: {order['detail1']}"
+        )
+    try:
+        await bot.send_message(user_id, user_msg, parse_mode="HTML")
+    except Exception:
+        pass
+    await call.message.edit_text(
+        call.message.text + "\n\n✅ <b>BAJARILDI</b>",
+        parse_mode="HTML"
+    )
+    await call.answer("✅ Bajarildi!")
+
+
 @router.callback_query(F.data == "back_main")
 async def back_main(call: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -1145,12 +1979,14 @@ async def admin_add_channel_start(call: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminStates.add_channel_link)
     await call.message.edit_text(
-        "➕ <b>Kanal qo'shish — 1-qadam</b>\n\n"
-        "Kanal linkini yuboring:\n"
-        "• Oddiy kanal: <code>https://t.me/kanalnom</code>\n"
-        "• Maxfiy kanal: <code>https://t.me/+xxxxxxxxxx</code>\n\n"
-        "⚠️ Bot kanalda <b>admin</b> bo'lishi kerak!\n"
-        "⚠️ Zaявka kanal bo'lsa — bot <b>Approve new members</b> huquqiga ega bo'lsin!",
+        "➕ <b>Kanal qo'shish</b>\n\n"
+        "<b>Ochiq kanal:</b>\n"
+        "<code>https://t.me/kanalnom</code>\n"
+        "→ Bot ID ni o'zi topadi ✅\n\n"
+        "<b>Maxfiy kanal:</b>\n"
+        "<code>https://t.me/+xxxxxxxxxx</code>\n"
+        "→ Keyingi qadamda kanaldan xabar forward qilasiz\n\n"
+        "⚠️ Bot kanalda <b>admin</b> bo'lishi kerak!",
         reply_markup=back_kb("admin_panel"),
         parse_mode="HTML"
     )
@@ -1164,17 +2000,46 @@ async def process_add_channel_link(message: Message, state: FSMContext):
     link = message.text.strip() if message.text else ""
     if not link.startswith("https://t.me/"):
         await message.answer(
-            "❌ Noto'g'ri link!\n\nMasalan: <code>https://t.me/+xxxxxxxxxx</code> yoki <code>https://t.me/kanalnom</code>",
+            "❌ Noto'g'ri link!\n\n"
+            "Masalan: <code>https://t.me/kanalnom</code> yoki <code>https://t.me/+xxxxxxxxxx</code>",
             parse_mode="HTML"
         )
         return
+
+    # Ochiq kanal — username orqali ID ni o'zi topadi
+    path = link.replace("https://t.me/", "").strip("/")
+    if not path.startswith("+"):
+        username = f"@{path}"
+        try:
+            chat = await bot.get_chat(username)
+            channel_id = str(chat.id)
+            name       = chat.title or path
+            await add_channel(channel_id, name, link)
+            await admin_log(ADMIN_ID, "add_channel", f"id={channel_id}, name={name}")
+            await state.clear()
+            await message.answer(
+                f"✅ <b>Kanal qo'shildi!</b>\n\n"
+                f"📢 <b>{name}</b>\n"
+                f"🆔 <code>{channel_id}</code>",
+                reply_markup=admin_keyboard(), parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.warning(f"get_chat xato {username}: {e}")
+            await message.answer(
+                "❌ Bot kanalda <b>admin</b> emas yoki kanal topilmadi!\n\n"
+                "Bot kanalga admin qiling, keyin qaytadan urinib ko'ring.",
+                reply_markup=back_kb("admin_panel"), parse_mode="HTML"
+            )
+            await state.clear()
+        return
+
+    # Maxfiy kanal — kanaldan xabar forward kerak
     await state.update_data(channel_link=link)
     await state.set_state(AdminStates.add_channel_id)
     await message.answer(
-        "✅ Link qabul qilindi!\n\n"
-        "Endi kanal ID sini yuboring:\n"
-        "<code>-1003928551808</code>\n\n"
-        "📌 Kanal ID ni bilish uchun: @username_to_id_bot",
+        "✅ Link saqlandi!\n\n"
+        "Endi <b>kanaldan istalgan xabarni</b> shu yerga <b>forward</b> qiling:\n\n"
+        "📌 Kanalga kiring → xabarni bosib ushlab turing → Forward → bu chatga yuboring",
         parse_mode="HTML"
     )
 
@@ -1183,32 +2048,36 @@ async def process_add_channel_link(message: Message, state: FSMContext):
 async def process_add_channel_id(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
-    channel_id = message.text.strip() if message.text else ""
-    if not channel_id.lstrip("-").isdigit():
-        await message.answer("❌ Kanal ID noto'g'ri! Masalan: <code>-1003928551808</code>", parse_mode="HTML")
+
+    # Forward qilingan xabardan kanal ID ni olish
+    channel_id = None
+    name       = None
+
+    if message.forward_from_chat:
+        channel_id = str(message.forward_from_chat.id)
+        name       = message.forward_from_chat.title or channel_id
+    elif message.forward_origin and hasattr(message.forward_origin, "chat"):
+        channel_id = str(message.forward_origin.chat.id)
+        name       = message.forward_origin.chat.title or channel_id
+
+    if not channel_id:
+        await message.answer(
+            "❌ Kanal xabari topilmadi!\n\n"
+            "Kanaldan xabarni <b>forward</b> qiling.\n"
+            "Agar kanal <b>content protection</b> yoqilgan bo'lsa — o'chiring, forward qiling, qaytadan yoqing.",
+            parse_mode="HTML"
+        )
         return
+
     data = await state.get_data()
     link = data.get("channel_link", "")
-    try:
-        chat = await bot.get_chat(int(channel_id))
-        name = chat.title or channel_id
-    except Exception as e:
-        logger.warning(f"get_chat xato {channel_id}: {e}")
-        await message.answer(
-            "❌ Bot kanalda <b>admin</b> emas yoki ID noto'g'ri!\n\n"
-            "Bot kanalga admin qiling, keyin qaytadan urinib ko'ring.",
-            reply_markup=back_kb("admin_panel"), parse_mode="HTML"
-        )
-        await state.clear()
-        return
     await add_channel(channel_id, name, link)
     await admin_log(ADMIN_ID, "add_channel", f"id={channel_id}, name={name}")
     await state.clear()
     await message.answer(
-        f"✅ Kanal qo'shildi!\n\n"
+        f"✅ <b>Kanal qo'shildi!</b>\n\n"
         f"📢 <b>{name}</b>\n"
-        f"🆔 <code>{channel_id}</code>\n"
-        f"🔗 {link}",
+        f"🆔 <code>{channel_id}</code>",
         reply_markup=admin_keyboard(), parse_mode="HTML"
     )
 
@@ -1234,6 +2103,23 @@ async def admin_remove_channel_handler(call: CallbackQuery):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML"
     )
     await call.answer()
+
+
+@router.callback_query(F.data.startswith("rm_ch_"))
+async def rm_channel_from_alert(call: CallbackQuery):
+    """Health alert xabaridagi tezkor o'chirish tugmasi."""
+    if call.from_user.id != ADMIN_ID:
+        return
+    channel_id = call.data[len("rm_ch_"):]
+    ch = await channels.find_one({"channel_id": channel_id})
+    ch_name = ch["channel_name"] if ch else channel_id
+    await remove_channel(channel_id)
+    await admin_log(ADMIN_ID, "remove_channel", f"id={channel_id} (health alert)")
+    await call.message.edit_text(
+        f"✅ <b>{ch_name}</b> kanali ro'yxatdan o'chirildi.",
+        parse_mode="HTML"
+    )
+    await call.answer("✅ O'chirildi!")
 
 
 @router.callback_query(F.data.startswith("delch_"))
@@ -1353,6 +2239,454 @@ async def process_min_referrals(message: Message, state: FSMContext):
         await message.answer("❌ To'g'ri son kiriting! Masalan: 3")
 
 
+@router.callback_query(F.data == "admin_exc_orders")
+async def admin_exc_orders_handler(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    pending = await get_pending_exchange_orders()
+    if not pending:
+        await call.answer("Kutayotgan almashtirish yo'q!", show_alert=True)
+        return
+    text    = "💱 <b>Kutayotgan almashtirish buyurtmalari:</b>\n\n"
+    buttons = []
+    for o in pending:
+        oid   = str(o["_id"])
+        uname = f"@{o['username']}" if o.get("username") else o.get("full_name", "")
+        if o["type"] == "uzs":
+            label = f"💵 {uname} — {o['stars']}⭐ → {o['amount']:,} UZS"
+            text += f"💵 {uname} | {o['stars']}⭐ → {o['amount']:,} UZS | 💳 {o['detail1']} ({o['detail2']})\n"
+        else:
+            label = f"🎮 {uname} — {o['stars']}⭐ → {o['amount']} UC"
+            text += f"🎮 {uname} | {o['stars']}⭐ → {o['amount']} UC | ID: {o['detail1']} ({o['detail2']})\n"
+        buttons.append([InlineKeyboardButton(
+            text=f"✅ {label}",
+            callback_data=f"done_exc|{oid}|{o['user_id']}"
+        )])
+    buttons.append([InlineKeyboardButton(text="🔙 Ortga", callback_data="admin_panel")])
+    await call.message.edit_text(
+        text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML"
+    )
+    await call.answer()
+
+
+def _variants_keyboard(vtype: str, variants: list, back_cb: str) -> InlineKeyboardMarkup:
+    unit = "UZS" if vtype == "uzs" else "UC"
+    buttons = []
+    for i, (stars, amount) in enumerate(variants):
+        label = f"Slot {i+1}: {stars}⭐ = {amount:,} {unit}" if stars > 0 else f"Slot {i+1}: (bo'sh)"
+        buttons.append([InlineKeyboardButton(text=f"✏️ {label}", callback_data=f"{vtype}_slot_{i}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Ortga", callback_data=back_cb)])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.callback_query(F.data == "admin_uzs_config")
+async def admin_uzs_config(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    variants = await get_variants("uzs")
+    await call.message.edit_text(
+        "💵 <b>UZS variantlarini sozlash</b>\n\n"
+        "O'zgartirish uchun slotga bosing:",
+        reply_markup=_variants_keyboard("uzs", variants, "admin_panel"),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "admin_pubg_config")
+async def admin_pubg_config(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    variants = await get_variants("pubg")
+    await call.message.edit_text(
+        "🎮 <b>PUBG UC variantlarini sozlash</b>\n\n"
+        "O'zgartirish uchun slotga bosing:",
+        reply_markup=_variants_keyboard("pubg", variants, "admin_panel"),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("uzs_slot_"))
+async def uzs_slot_edit(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    try:
+        slot = int(call.data.split("_")[2])
+    except (ValueError, IndexError):
+        await call.answer("❌ Xato!", show_alert=True)
+        return
+    variants = await get_variants("uzs")
+    cur = variants[slot] if slot < len(variants) else [0, 0]
+    await state.update_data(edit_vtype="uzs", edit_slot=slot)
+    await state.set_state(AdminStates.set_uzs_variant)
+    await call.message.edit_text(
+        f"💵 <b>UZS Slot {slot+1}</b>\n\n"
+        f"Hozirgi: <b>{cur[0]}⭐ = {cur[1]:,} UZS</b>\n\n"
+        f"Yangi qiymatni kiriting:\n"
+        f"<code>stars uzs_miqdor</code>\n"
+        f"Masalan: <code>100 50000</code>\n\n"
+        f"O'chirish uchun: <code>0 0</code>",
+        reply_markup=back_kb("admin_uzs_config"), parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("pubg_slot_"))
+async def pubg_slot_edit(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    try:
+        slot = int(call.data.split("_")[2])
+    except (ValueError, IndexError):
+        await call.answer("❌ Xato!", show_alert=True)
+        return
+    variants = await get_variants("pubg")
+    cur = variants[slot] if slot < len(variants) else [0, 0]
+    await state.update_data(edit_vtype="pubg", edit_slot=slot)
+    await state.set_state(AdminStates.set_pubg_variant)
+    await call.message.edit_text(
+        f"🎮 <b>PUBG Slot {slot+1}</b>\n\n"
+        f"Hozirgi: <b>{cur[0]}⭐ = {cur[1]} UC</b>\n\n"
+        f"Yangi qiymatni kiriting:\n"
+        f"<code>stars uc_miqdor</code>\n"
+        f"Masalan: <code>15 5</code>\n\n"
+        f"O'chirish uchun: <code>0 0</code>",
+        reply_markup=back_kb("admin_pubg_config"), parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.message(AdminStates.set_uzs_variant)
+async def process_uzs_variant(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        parts  = message.text.strip().split()
+        stars  = int(parts[0])
+        amount = float(parts[1])
+        if stars < 0 or amount < 0:
+            raise ValueError
+    except Exception:
+        await message.answer("❌ Format: <code>stars uzs_miqdor</code>\nMasalan: <code>100 50000</code>", parse_mode="HTML")
+        return
+    data = await state.get_data()
+    slot = data["edit_slot"]
+    await set_variant_slot("uzs", slot, stars, amount)
+    await admin_log(ADMIN_ID, "set_uzs_variant", f"slot={slot}, stars={stars}, uzs={amount}")
+    await state.clear()
+    label = f"{stars}⭐ = {amount:,.0f} UZS" if stars > 0 else "o'chirildi"
+    await message.answer(
+        f"✅ UZS Slot {slot+1}: <b>{label}</b>",
+        reply_markup=admin_keyboard(), parse_mode="HTML"
+    )
+
+
+@router.message(AdminStates.set_pubg_variant)
+async def process_pubg_variant(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        parts = message.text.strip().split()
+        stars = int(parts[0])
+        uc    = float(parts[1])
+        if stars < 0 or uc < 0:
+            raise ValueError
+    except Exception:
+        await message.answer("❌ Format: <code>stars uc_miqdor</code>\nMasalan: <code>15 5</code>", parse_mode="HTML")
+        return
+    data = await state.get_data()
+    slot = data["edit_slot"]
+    await set_variant_slot("pubg", slot, stars, uc)
+    await admin_log(ADMIN_ID, "set_pubg_variant", f"slot={slot}, stars={stars}, uc={uc}")
+    await state.clear()
+    label = f"{stars}⭐ = {uc} UC" if stars > 0 else "o'chirildi"
+    await message.answer(
+        f"✅ PUBG Slot {slot+1}: <b>{label}</b>",
+        reply_markup=admin_keyboard(), parse_mode="HTML"
+    )
+
+
+# ===================== ADMIN USER SEARCH =====================
+
+@router.callback_query(F.data == "admin_search_user")
+async def admin_search_user_start(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.search_user)
+    await call.message.edit_text(
+        "🔍 <b>Foydalanuvchi qidirish</b>\n\n"
+        "Quyidagilardan birini yuboring:\n"
+        "• <code>123456789</code> — Telegram ID\n"
+        "• <code>@username</code> — Username\n"
+        "• <code>Ism</code> — Ism bo'yicha\n\n"
+        "<i>Bekor qilish: /cancel</i>",
+        reply_markup=back_kb("admin_panel"),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.message(AdminStates.search_user)
+async def admin_search_user_process(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    query = message.text.strip()
+
+    # ID bo'yicha qidirish
+    user = None
+    if query.lstrip("-").isdigit():
+        user = await users.find_one({"user_id": int(query)})
+    # Username bo'yicha
+    elif query.startswith("@"):
+        uname = query[1:].lower()
+        user = await users.find_one({"username": {"$regex": f"^{uname}$", "$options": "i"}})
+    else:
+        # Ism bo'yicha (birinchi mos kelgan)
+        user = await users.find_one({"full_name": {"$regex": query, "$options": "i"}})
+
+    if not user:
+        await message.answer(
+            f"❌ <b>Topilmadi:</b> <code>{query}</code>\n\n"
+            f"Qayta qidirish uchun tugmani bosing.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔍 Qayta qidirish", callback_data="admin_search_user")],
+                [InlineKeyboardButton(text="🔙 Admin panel",    callback_data="admin_panel")],
+            ]),
+            parse_mode="HTML"
+        )
+        return
+
+    await _show_user_card(message, user, send=True)
+
+
+async def _show_user_card(msg, user: dict, send: bool = True, edit: bool = False):
+    uid       = user["user_id"]
+    name      = user.get("full_name") or "—"
+    uname     = f"@{user['username']}" if user.get("username") else "—"
+    balance   = user.get("balance", 0)
+    refs      = user.get("referral_count", 0)
+    banned    = user.get("is_banned", False)
+    joined    = user.get("created_at")
+    joined_str = ensure_utc(joined).strftime("%d.%m.%Y %H:%M") if joined else "—"
+
+    status = "🚫 BAN" if banned else "✅ Faol"
+    ban_btn = ("✅ Bandan chiqarish", f"unban_u_{uid}") if banned else ("🚫 Banlash", f"ban_u_{uid}")
+
+    text = (
+        f"👤 <b>Foydalanuvchi kartasi</b>\n\n"
+        f"🪪 ID: <code>{uid}</code>\n"
+        f"📛 Ism: <b>{name}</b>\n"
+        f"🔗 Username: {uname}\n"
+        f"💰 Balans: <b>{balance}⭐</b>\n"
+        f"👥 Referrallar: <b>{refs} ta</b>\n"
+        f"📅 Qo'shilgan: {joined_str}\n"
+        f"🔒 Holat: {status}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="➕ Balans",  callback_data=f"su_add_{uid}"),
+            InlineKeyboardButton(text="➖ Balans",  callback_data=f"su_ded_{uid}"),
+        ],
+        [InlineKeyboardButton(text=ban_btn[0],         callback_data=ban_btn[1])],
+        [InlineKeyboardButton(text="✉️ Xabar yuborish", callback_data=f"su_msg_{uid}")],
+        [InlineKeyboardButton(text="🔍 Qayta qidirish", callback_data="admin_search_user")],
+        [InlineKeyboardButton(text="🔙 Admin panel",    callback_data="admin_panel")],
+    ])
+    if send:
+        await msg.answer(text, reply_markup=kb, parse_mode="HTML")
+    elif edit:
+        await msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("ban_u_"))
+async def search_ban_user(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    try:
+        uid = int(call.data[len("ban_u_"):])
+    except ValueError:
+        await call.answer("Xato!", show_alert=True)
+        return
+    await ban_user(uid, "Admin tomonidan ban qilindi")
+    await admin_log(ADMIN_ID, "ban", f"uid={uid}")
+    user = await users.find_one({"user_id": uid})
+    if user:
+        await _show_user_card(call.message, user, send=False, edit=True)
+    await call.answer("🚫 Banlandi!")
+    try:
+        await bot.send_message(uid, "🚫 Siz admin tomonidan botdan bloklangansiz.")
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("unban_u_"))
+async def search_unban_user(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    try:
+        uid = int(call.data[len("unban_u_"):])
+    except ValueError:
+        await call.answer("Xato!", show_alert=True)
+        return
+    await unban_user(uid)
+    await admin_log(ADMIN_ID, "unban", f"uid={uid}")
+    user = await users.find_one({"user_id": uid})
+    if user:
+        await _show_user_card(call.message, user, send=False, edit=True)
+    await call.answer("✅ Ban olib tashlandi!")
+
+
+@router.callback_query(F.data.startswith("su_add_"))
+async def search_user_add_bal(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    uid = int(call.data[len("su_add_"):])
+    await state.set_state(AdminStates.add_balance_input)
+    await state.update_data(target_uid=uid)
+    await call.message.edit_text(
+        f"💰 <b>Balans qo'shish</b>\n"
+        f"🆔 User: <code>{uid}</code>\n\n"
+        f"Miqdorni kiriting (masalan: <code>10</code>):\n\n"
+        f"<i>Bekor qilish: /cancel</i>",
+        reply_markup=back_kb("admin_panel"),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("su_ded_"))
+async def search_user_ded_bal(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    uid = int(call.data[len("su_ded_"):])
+    await state.set_state(AdminStates.deduct_balance_input)
+    await state.update_data(target_uid=uid)
+    await call.message.edit_text(
+        f"💸 <b>Balans ayirish</b>\n"
+        f"🆔 User: <code>{uid}</code>\n\n"
+        f"Miqdorni kiriting (masalan: <code>10</code>):\n\n"
+        f"<i>Bekor qilish: /cancel</i>",
+        reply_markup=back_kb("admin_panel"),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("su_msg_"))
+async def search_user_msg_start(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    uid = int(call.data[len("su_msg_"):])
+    await state.set_state(AdminStates.send_user_msg)
+    await state.update_data(target_uid=uid)
+    await call.message.edit_text(
+        f"✉️ <b>Xabar yuborish</b>\n"
+        f"🆔 User: <code>{uid}</code>\n\n"
+        f"Xabar matnini yuboring:\n\n"
+        f"<i>Bekor qilish: /cancel</i>",
+        reply_markup=back_kb("admin_panel"),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.message(AdminStates.send_user_msg)
+async def search_user_msg_send(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    data = await state.get_data()
+    uid  = data.get("target_uid")
+    await state.clear()
+    if not uid:
+        await message.answer("❌ Xato: user topilmadi.")
+        return
+    try:
+        await bot.send_message(
+            uid,
+            f"📩 <b>Admin xabari:</b>\n\n{message.text}",
+            parse_mode="HTML"
+        )
+        await message.answer(
+            f"✅ Xabar yuborildi → <code>{uid}</code>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔍 Qayta qidirish", callback_data="admin_search_user")],
+                [InlineKeyboardButton(text="🔙 Admin panel",    callback_data="admin_panel")],
+            ]),
+            parse_mode="HTML"
+        )
+    except (TelegramForbiddenError, TelegramNotFound):
+        await message.answer(
+            f"❌ Yuborib bo'lmadi — foydalanuvchi botni bloklagan yoki topilmadi.",
+            reply_markup=back_kb("admin_panel"),
+            parse_mode="HTML"
+        )
+    await admin_log(ADMIN_ID, "send_message", f"uid={uid}")
+
+
+@router.callback_query(F.data.startswith("su_view_"))
+async def search_user_view(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    try:
+        uid = int(call.data[len("su_view_"):])
+    except ValueError:
+        await call.answer("Xato!", show_alert=True)
+        return
+    user = await users.find_one({"user_id": uid})
+    if not user:
+        await call.answer("Foydalanuvchi topilmadi!", show_alert=True)
+        return
+    await _show_user_card(call.message, user, send=False, edit=True)
+    await call.answer()
+
+
+@router.callback_query(F.data == "admin_banned")
+async def admin_banned_list(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    banned_users = await users.find({"is_banned": True}).limit(50).to_list(50)
+    if not banned_users:
+        await call.answer("Banlangan foydalanuvchi yo'q!", show_alert=True)
+        return
+    buttons = []
+    for u in banned_users:
+        uname  = f"@{u['username']}" if u.get("username") else u.get("full_name", "Noma'lum")
+        reason = u.get("ban_reason", "—")
+        buttons.append([InlineKeyboardButton(
+            text=f"🔓 {uname} ({u['user_id']}) | {reason}",
+            callback_data=f"unban_{u['user_id']}"
+        )])
+    buttons.append([InlineKeyboardButton(text="🔙 Ortga", callback_data="admin_panel")])
+    await call.message.edit_text(
+        f"🚫 <b>Banlangan foydalanuvchilar: {len(banned_users)} ta</b>\n\n"
+        f"Unban qilish uchun tugmani bosing:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("unban_"))
+async def admin_unban_user(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    try:
+        uid = int(call.data.split("_")[1])
+    except Exception:
+        await call.answer("❌ Noto'g'ri format!", show_alert=True)
+        return
+    await unban_user(uid)
+    await admin_log(ADMIN_ID, "unban", f"uid={uid}")
+    try:
+        await bot.send_message(uid, "✅ Siz botdan ban olib tashlandi! /start bosing.")
+    except Exception:
+        pass
+    await call.answer(f"✅ {uid} unban qilindi!", show_alert=True)
+    await admin_banned_list(call)
+
+
 @router.callback_query(F.data == "admin_add_balance")
 async def admin_add_balance(call: CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -1371,10 +2705,16 @@ async def admin_add_balance(call: CallbackQuery, state: FSMContext):
 async def process_add_balance(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
+    data = await state.get_data()
+    target_uid = data.get("target_uid")
     try:
-        parts = message.text.strip().split()
-        uid   = int(parts[0])
-        amt   = float(parts[1])
+        if target_uid:
+            amt = float(message.text.strip())
+            uid = target_uid
+        else:
+            parts = message.text.strip().split()
+            uid   = int(parts[0])
+            amt   = float(parts[1])
         if amt <= 0:
             raise ValueError
         if not await get_user(uid):
@@ -1384,20 +2724,23 @@ async def process_add_balance(message: Message, state: FSMContext):
         await admin_log(ADMIN_ID, "add_balance", f"uid={uid}, amt={amt}")
         await state.clear()
         new_bal = await get_balance(uid)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👤 Kartani ko'rish", callback_data=f"su_view_{uid}")],
+            [InlineKeyboardButton(text="🔙 Admin panel",     callback_data="admin_panel")],
+        ]) if target_uid else admin_keyboard()
         await message.answer(
             f"✅ <code>{uid}</code> ga <b>+{amt}⭐</b> qo'shildi!\n"
             f"Yangi balans: <b>{new_bal}⭐</b>",
-            reply_markup=admin_keyboard(), parse_mode="HTML"
+            reply_markup=kb, parse_mode="HTML"
         )
         try:
             await bot.send_message(uid, f"💰 Hisobingizga <b>+{amt}⭐</b> qo'shildi!", parse_mode="HTML")
         except Exception:
             pass
     except Exception:
-        await message.answer(
-            "❌ Format: <code>USER_ID MIQDOR</code>\nMasalan: <code>123456789 10.5</code>",
-            parse_mode="HTML"
-        )
+        hint = "Miqdorni kiriting (masalan: <code>10.5</code>)" if target_uid else \
+               "Format: <code>USER_ID MIQDOR</code>\nMasalan: <code>123456789 10.5</code>"
+        await message.answer(f"❌ {hint}", parse_mode="HTML")
 
 
 @router.callback_query(F.data == "admin_deduct_balance")
@@ -1418,10 +2761,16 @@ async def admin_deduct_balance_cb(call: CallbackQuery, state: FSMContext):
 async def process_deduct_balance(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
+    data = await state.get_data()
+    target_uid = data.get("target_uid")
     try:
-        parts = message.text.strip().split()
-        uid   = int(parts[0])
-        amt   = float(parts[1])
+        if target_uid:
+            amt = float(message.text.strip())
+            uid = target_uid
+        else:
+            parts = message.text.strip().split()
+            uid   = int(parts[0])
+            amt   = float(parts[1])
         if amt <= 0:
             raise ValueError
         if not await get_user(uid):
@@ -1434,10 +2783,14 @@ async def process_deduct_balance(message: Message, state: FSMContext):
             await message.answer("❌ Balans yetarli emas!", reply_markup=admin_keyboard())
             return
         new_bal = await get_balance(uid)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👤 Kartani ko'rish", callback_data=f"su_view_{uid}")],
+            [InlineKeyboardButton(text="🔙 Admin panel",     callback_data="admin_panel")],
+        ]) if target_uid else admin_keyboard()
         await message.answer(
             f"✅ <code>{uid}</code> dan <b>-{amt}⭐</b> ayirildi!\n"
             f"Yangi balans: <b>{new_bal}⭐</b>",
-            reply_markup=admin_keyboard(), parse_mode="HTML"
+            reply_markup=kb, parse_mode="HTML"
         )
     except Exception:
         await message.answer(
@@ -1469,7 +2822,7 @@ async def admin_stats(call: CallbackQuery):
 
 
 async def show_users_page(message, top_list: list, page: int, edit: bool = True):
-    per_page = 50
+    per_page = 25
     total    = len(top_list)
     start    = page * per_page
     end      = min(start + per_page, total)
@@ -1505,7 +2858,7 @@ async def admin_users_handler(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         return
     global _users_cache
-    _users_cache = await users.find().sort("balance", -1).limit(150).to_list(150)
+    _users_cache = await users.find().sort("balance", -1).limit(250).to_list(250)
     await show_users_page(call.message, _users_cache, page=0, edit=True)
     await call.answer()
 
@@ -1515,9 +2868,12 @@ async def admin_users_page(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         return
     global _users_cache
-    page = int(call.data.split("_")[1])
+    try:
+        page = int(call.data.split("_")[1])
+    except (IndexError, ValueError):
+        page = 0
     if not _users_cache:
-        _users_cache = await users.find().sort("balance", -1).limit(150).to_list(150)
+        _users_cache = await users.find().sort("balance", -1).limit(250).to_list(250)
     await show_users_page(call.message, _users_cache, page=page, edit=True)
     await call.answer()
 
@@ -1547,62 +2903,159 @@ async def process_broadcast(message: Message, state: FSMContext):
     await state.clear()
 
     user_ids   = await get_all_user_ids()
-    sent, failed, blocked = 0, 0, 0
-    status_msg = await message.answer(f"📣 Yuborilmoqda... 0/{len(user_ids)}")
+    total      = len(user_ids)
+    sent = failed = blocked = 0
+    status_msg = await message.answer(f"📣 Yuborilmoqda... 0/{total}")
 
-    async def send_to_user(uid: int) -> str:
-        for attempt in range(3):
-            try:
-                if message.photo:
-                    await bot.send_photo(uid, photo=message.photo[-1].file_id,
-                        caption=f"📣 {message.caption}" if message.caption else "📣", parse_mode="HTML")
-                elif message.video:
-                    await bot.send_video(uid, video=message.video.file_id,
-                        caption=f"📣 {message.caption}" if message.caption else "📣", parse_mode="HTML")
-                elif message.animation:
-                    await bot.send_animation(uid, animation=message.animation.file_id,
-                        caption=f"📣 {message.caption}" if message.caption else "📣", parse_mode="HTML")
-                elif message.text:
-                    await bot.send_message(uid, f"📣 {message.text}", parse_mode="HTML")
-                return "sent"
-            except Exception as e:
-                err = str(e).lower()
-                if "blocked" in err or "deactivated" in err or "chat not found" in err:
+    semaphore = asyncio.Semaphore(10)
+
+    async def _send(uid: int) -> str:
+        async with semaphore:
+            for attempt in range(5):
+                try:
+                    if message.photo:
+                        await bot.send_photo(
+                            uid, photo=message.photo[-1].file_id,
+                            caption=f"📣 {message.caption or ''}", parse_mode="HTML"
+                        )
+                    elif message.video:
+                        await bot.send_video(
+                            uid, video=message.video.file_id,
+                            caption=f"📣 {message.caption or ''}", parse_mode="HTML"
+                        )
+                    elif message.animation:
+                        await bot.send_animation(
+                            uid, animation=message.animation.file_id,
+                            caption=f"📣 {message.caption or ''}", parse_mode="HTML"
+                        )
+                    elif message.text:
+                        await bot.send_message(uid, f"📣 {message.text}", parse_mode="HTML")
+                    await asyncio.sleep(0.05)  # ~20 msg/sec limit
+                    return "sent"
+                except TelegramRetryAfter as e:
+                    await asyncio.sleep(e.retry_after + 1)
+                except (TelegramForbiddenError, TelegramNotFound):
                     return "blocked"
-                if "429" in err or "too many requests" in err:
-                    await asyncio.sleep(5 * (attempt + 1))
-                    continue
-                if attempt == 2:
-                    return "failed"
-                await asyncio.sleep(1)
-        return "failed"
+                except Exception as e:
+                    err = str(e).lower()
+                    if "blocked" in err or "deactivated" in err or "not found" in err:
+                        return "blocked"
+                    await asyncio.sleep(2 ** attempt)
+            return "failed"
 
-    for i, uid in enumerate(user_ids):
-        result = await send_to_user(uid)
+    tasks     = [_send(uid) for uid in user_ids]
+    done_cnt  = 0
+
+    for coro in asyncio.as_completed(tasks):
+        result = await coro
+        done_cnt += 1
         if result == "sent":
             sent += 1
         elif result == "blocked":
             blocked += 1
         else:
             failed += 1
-        if (i + 1) % 30 == 0:
+        if done_cnt % 50 == 0 or done_cnt == total:
             try:
                 await status_msg.edit_text(
-                    f"📣 Yuborilmoqda... {i+1}/{len(user_ids)}\n"
-                    f"✅ Yuborildi: {sent}\n🚫 Bloklagan: {blocked}\n❌ Xato: {failed}"
+                    f"📣 Yuborilmoqda... {done_cnt}/{total}\n"
+                    f"✅ {sent} | 🚫 {blocked} | ❌ {failed}"
                 )
             except Exception:
                 pass
-        await asyncio.sleep(0.1)
 
     await admin_log(ADMIN_ID, "broadcast", f"sent={sent}, blocked={blocked}, failed={failed}")
     await status_msg.edit_text(
         f"✅ <b>Broadcast tugadi!</b>\n\n"
-        f"✅ Yuborildi: <b>{sent}</b>\n🚫 Bloklagan: <b>{blocked}</b>\n"
-        f"❌ Xato: <b>{failed}</b>\n📊 Jami: <b>{len(user_ids)}</b>",
+        f"📊 Jami: <b>{total}</b>\n"
+        f"✅ Yuborildi: <b>{sent}</b>\n"
+        f"🚫 Bloklagan: <b>{blocked}</b>\n"
+        f"❌ Xato: <b>{failed}</b>",
         parse_mode="HTML"
     )
     await message.answer("🏠 Admin panel:", reply_markup=admin_keyboard())
+
+
+# ===================== KANAL SOGLIGI TEKSHIRUVI =====================
+
+async def check_channel_health():
+    """Har 6 soatda kanallarni tekshiradi, muammo bo'lsa adminga xabar beradi."""
+    await asyncio.sleep(30)
+    bot_info = await bot.get_me()
+    while True:
+        try:
+            chs = await get_channels()
+            for ch in chs:
+                cid_str      = ch["channel_id"]
+                channel_name = ch["channel_name"]
+                channel_link = ch.get("channel_link", "")
+                last_alert   = ch.get("health_alert_at")
+
+                # Bir xil xabarni 30 daqiqada bir marta yubor
+                if last_alert:
+                    diff = (datetime.now(timezone.utc) - ensure_utc(last_alert)).total_seconds()
+                    if diff < 1800:
+                        continue
+
+                problem = None
+                try:
+                    cid = int(cid_str)
+                    member = await bot.get_chat_member(cid, bot_info.id)
+                    if member.status not in ("administrator", "creator"):
+                        problem = (
+                            f"⚠️ <b>Bot admin emas!</b>\n\n"
+                            f"📢 Kanal: <b>{channel_name}</b>\n"
+                            f"Bot ushbu kanalda faqat oddiy a'zo. "
+                            f"Iltimos botni <b>admin</b> qiling!"
+                        )
+                except TelegramForbiddenError:
+                    problem = (
+                        f"🚫 <b>Bot kanaldan chiqarildi!</b>\n\n"
+                        f"📢 Kanal: <b>{channel_name}</b>\n"
+                        f"Bot bu kanalga kira olmaydi. "
+                        f"Botni qayta qo'shing yoki kanalni o'chiring."
+                    )
+                except TelegramNotFound:
+                    problem = (
+                        f"❌ <b>Kanal topilmadi!</b>\n\n"
+                        f"📢 Kanal: <b>{channel_name}</b>\n"
+                        f"Kanal o'chirilgan yoki ID noto'g'ri. "
+                        f"Kanalni ro'yxatdan olib tashlang."
+                    )
+                except Exception as e:
+                    logger.warning(f"Kanal health check xato ({cid_str}): {e}")
+
+                if problem:
+                    await channels.update_one(
+                        {"channel_id": cid_str},
+                        {"$set": {"health_alert_at": datetime.now(timezone.utc)}}
+                    )
+                    try:
+                        await bot.send_message(
+                            ADMIN_ID,
+                            problem,
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(
+                                    text="🔗 Kanal havolasi",
+                                    url=channel_link
+                                )] if channel_link else [],
+                                [InlineKeyboardButton(
+                                    text="➖ Kanalni o'chirish",
+                                    callback_data=f"rm_ch_{cid_str}"
+                                )],
+                                [InlineKeyboardButton(
+                                    text="🔧 Admin panel",
+                                    callback_data="admin_panel"
+                                )],
+                            ]),
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.error(f"check_channel_health xato: {e}")
+
+        await asyncio.sleep(1800)  # 30 daqiqa
 
 
 # ===================== AUTO CHECK =====================
@@ -1651,6 +3104,8 @@ async def auto_check_subscriptions():
 
 async def main():
     await init_db()
+    dp.message.middleware(BanMiddleware())
+    dp.callback_query.middleware(BanMiddleware())
     dp.include_router(router)
 
     async def health(request):
@@ -1666,6 +3121,7 @@ async def main():
     logger.info(f"✅ Web server port {port} da ishga tushdi!")
 
     asyncio.create_task(auto_check_subscriptions())
+    asyncio.create_task(check_channel_health())
 
     logger.info("✅ Bot ishga tushdi!")
     await dp.start_polling(bot, skip_updates=True)
@@ -1673,3 +3129,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+        
