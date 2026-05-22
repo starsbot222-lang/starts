@@ -28,7 +28,7 @@ SUPPORT_GROUP = os.environ.get("SUPPORT_GROUP", "https://t.me/FreeStarsbotInfo")
 TIMEZONE      = pytz.timezone("Asia/Tashkent")
 DB_NAME       = os.environ.get("DB_NAME", "starsbot")
 
-MIN_REFERRALS_FOR_GIFT = 3
+MIN_REFERRALS_FOR_GIFT = 3  # default, DB dan o'qiladi
 # ======================================================
 
 logging.basicConfig(
@@ -74,6 +74,11 @@ async def init_db():
     await settings_col.update_one(
         {"key": "subscribe_stars"},
         {"$setOnInsert": {"key": "subscribe_stars", "value": "0.10"}},
+        upsert=True
+    )
+    await settings_col.update_one(
+        {"key": "min_referrals"},
+        {"$setOnInsert": {"key": "min_referrals", "value": "3"}},
         upsert=True
     )
 
@@ -330,6 +335,14 @@ async def check_subscription(user_id: int):
     return len(not_subbed) == 0, not_subbed
 
 
+async def get_min_referrals() -> int:
+    val = await get_setting("min_referrals")
+    try:
+        return int(val)
+    except Exception:
+        return MIN_REFERRALS_FOR_GIFT
+
+
 async def get_referral_count(user_id: int) -> int:
     user = await users.find_one({"user_id": user_id})
     return user.get("referral_count", 0) if user else 0
@@ -356,6 +369,7 @@ class AdminStates(StatesGroup):
     add_channel_id       = State()
     set_referral_stars   = State()
     set_subscribe_stars  = State()
+    set_min_referrals    = State()
     broadcast            = State()
     add_balance_input    = State()
     deduct_balance_input = State()
@@ -397,6 +411,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="➖ Kanal o'chirish",      callback_data="admin_remove_channel")],
         [InlineKeyboardButton(text="⭐ Referral stars sozla", callback_data="admin_set_referral")],
         [InlineKeyboardButton(text="⭐ Obuna stars sozla",    callback_data="admin_set_subscribe")],
+        [InlineKeyboardButton(text="👥 Min referral sozla",   callback_data="admin_set_min_refs")],
         [InlineKeyboardButton(text="💰 Balans qo'shish",      callback_data="admin_add_balance")],
         [InlineKeyboardButton(text="💸 Balans ayirish",       callback_data="admin_deduct_balance")],
         [InlineKeyboardButton(text="📦 Buyurtmalar",          callback_data="admin_orders")],
@@ -553,6 +568,7 @@ async def cmd_start(message: Message):
     balance   = await get_balance(user_id)
     ref_stars = await get_setting("referral_stars") or "0.25"
     sub_stars = await get_setting("subscribe_stars") or "0.10"
+    min_refs  = await get_min_referrals()
 
     await message.answer(
         f"⭐ <b>Stars Gift Bot</b>\n\n"
@@ -561,7 +577,7 @@ async def cmd_start(message: Message):
         f"• Kanal obuna → <b>+{sub_stars}⭐</b>\n"
         f"• Stars to'pla → 🎁 Gift ol!\n\n"
         f"⏰ Gift olish vaqti: <b>20:00 — 00:00</b>\n"
-        f"👥 Gift uchun kamida <b>{MIN_REFERRALS_FOR_GIFT} ta referral</b> kerak!",
+        f"👥 Gift uchun kamida <b>{min_refs} ta referral</b> kerak!",
         reply_markup=main_menu(user_id),
         parse_mode="HTML"
     )
@@ -595,16 +611,17 @@ async def show_balance(call: CallbackQuery):
     ref_count = user.get("referral_count", 0) if user else 0
     bot_info  = await bot.get_me()
     ref_link  = f"https://t.me/{bot_info.username}?start={user_id}"
+    min_refs  = await get_min_referrals()
 
     ref_status = (
-        f"✅ Gift olish mumkin (👥 {ref_count}/{MIN_REFERRALS_FOR_GIFT})"
-        if ref_count >= MIN_REFERRALS_FOR_GIFT
-        else f"❌ Gift uchun yana {MIN_REFERRALS_FOR_GIFT - ref_count} ta do'st kerak"
+        f"✅ Gift olish mumkin (👥 {ref_count}/{min_refs})"
+        if ref_count >= min_refs
+        else f"❌ Gift uchun yana {min_refs - ref_count} ta do'st kerak"
     )
 
     await call.message.edit_text(
         f"💰 <b>Balansingiz: {balance}⭐</b>\n\n"
-        f"👥 Taklif qilganlar: <b>{ref_count}/{MIN_REFERRALS_FOR_GIFT} kishi</b>\n"
+        f"👥 Taklif qilganlar: <b>{ref_count}/{min_refs} kishi</b>\n"
         f"{ref_status}\n\n"
         f"🔗 Referral linkingiz:\n<code>{ref_link}</code>",
         reply_markup=back_kb(), parse_mode="HTML"
@@ -623,8 +640,9 @@ async def show_referral(call: CallbackQuery):
     balance   = await get_balance(user_id)
     bot_info  = await bot.get_me()
     ref_link  = f"https://t.me/{bot_info.username}?start={user_id}"
+    min_refs  = await get_min_referrals()
 
-    remaining     = max(0, MIN_REFERRALS_FOR_GIFT - ref_count)
+    remaining     = max(0, min_refs - ref_count)
     progress_text = (
         f"✅ <b>Gift olish huquqingiz bor!</b>"
         if remaining == 0
@@ -635,7 +653,7 @@ async def show_referral(call: CallbackQuery):
         f"👥 <b>Referral tizimi</b>\n\n"
         f"🔗 Sizning linkingiz:\n<code>{ref_link}</code>\n\n"
         f"🎁 Har bir do'st uchun: <b>+{ref_stars}⭐</b>\n"
-        f"👤 Taklif qilganlar: <b>{ref_count}/{MIN_REFERRALS_FOR_GIFT} kishi</b>\n"
+        f"👤 Taklif qilganlar: <b>{ref_count}/{min_refs} kishi</b>\n"
         f"💰 Balans: <b>{balance}⭐</b>\n\n"
         f"{progress_text}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -864,15 +882,16 @@ async def buy_gift_menu(call: CallbackQuery):
     user_id   = call.from_user.id
     balance   = await get_balance(user_id)
     ref_count = await get_referral_count(user_id)
+    min_refs  = await get_min_referrals()
 
-    if ref_count < MIN_REFERRALS_FOR_GIFT:
-        remaining = MIN_REFERRALS_FOR_GIFT - ref_count
+    if ref_count < min_refs:
+        remaining = min_refs - ref_count
         bot_info  = await bot.get_me()
         ref_link  = f"https://t.me/{bot_info.username}?start={user_id}"
         await call.message.edit_text(
             f"🎁 <b>Gift olish</b>\n\n"
-            f"❌ Gift olish uchun kamida <b>{MIN_REFERRALS_FOR_GIFT} ta do'st</b> taklif qilishingiz kerak!\n\n"
-            f"👥 Siz taklif qilganlar: <b>{ref_count}/{MIN_REFERRALS_FOR_GIFT}</b>\n"
+            f"❌ Gift olish uchun kamida <b>{min_refs} ta do'st</b> taklif qilishingiz kerak!\n\n"
+            f"👥 Siz taklif qilganlar: <b>{ref_count}/{min_refs}</b>\n"
             f"⏳ Yana <b>{remaining} ta do'st</b> kerak\n\n"
             f"🔗 Referral linkingiz:\n<code>{ref_link}</code>",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -890,7 +909,7 @@ async def buy_gift_menu(call: CallbackQuery):
     await call.message.edit_text(
         f"🎁 <b>Gift olish</b>\n\n"
         f"💰 Balans: <b>{balance}⭐</b>\n"
-        f"👥 Referrallar: <b>{ref_count}/{MIN_REFERRALS_FOR_GIFT}</b> ✅\n\n"
+        f"👥 Referrallar: <b>{ref_count}/{min_refs}</b> ✅\n\n"
         f"✅ = Sotib olish mumkin\n"
         f"❌ = Stars yetarli emas\n\n"
         f"Qaysi giftni xohlaysiz? 👇",
@@ -907,10 +926,11 @@ async def select_gift(call: CallbackQuery):
 
     user_id   = call.from_user.id
     ref_count = await get_referral_count(user_id)
+    min_refs  = await get_min_referrals()
 
-    if ref_count < MIN_REFERRALS_FOR_GIFT:
+    if ref_count < min_refs:
         await call.answer(
-            f"❌ Gift olish uchun {MIN_REFERRALS_FOR_GIFT} ta referral kerak!\nSizda: {ref_count} ta",
+            f"❌ Gift olish uchun {min_refs} ta referral kerak!\nSizda: {ref_count} ta",
             show_alert=True
         )
         return
@@ -953,10 +973,11 @@ async def confirm_gift(call: CallbackQuery):
 
     user_id   = call.from_user.id
     ref_count = await get_referral_count(user_id)
+    min_refs  = await get_min_referrals()
 
-    if ref_count < MIN_REFERRALS_FOR_GIFT:
+    if ref_count < min_refs:
         await call.answer(
-            f"❌ Gift olish uchun {MIN_REFERRALS_FOR_GIFT} ta referral kerak!\nSizda: {ref_count} ta",
+            f"❌ Gift olish uchun {min_refs} ta referral kerak!\nSizda: {ref_count} ta",
             show_alert=True
         )
         return
@@ -1063,6 +1084,7 @@ async def back_main(call: CallbackQuery, state: FSMContext):
     balance   = await get_balance(user_id)
     ref_stars = await get_setting("referral_stars") or "0.25"
     sub_stars = await get_setting("subscribe_stars") or "0.10"
+    min_refs  = await get_min_referrals()
     await call.message.edit_text(
         f"⭐ <b>Stars Gift Bot</b>\n\n"
         f"💰 Balansingiz: <b>{balance}⭐</b>\n\n"
@@ -1070,7 +1092,7 @@ async def back_main(call: CallbackQuery, state: FSMContext):
         f"• Kanal obuna → <b>+{sub_stars}⭐</b>\n"
         f"• Stars to'pla → 🎁 Gift ol!\n\n"
         f"⏰ Gift olish vaqti: <b>20:00 — 00:00</b>\n"
-        f"👥 Gift uchun kamida <b>{MIN_REFERRALS_FOR_GIFT} ta referral</b> kerak!",
+        f"👥 Gift uchun kamida <b>{min_refs} ta referral</b> kerak!",
         reply_markup=main_menu(user_id), parse_mode="HTML"
     )
     await call.answer()
@@ -1298,6 +1320,39 @@ async def process_subscribe_stars(message: Message, state: FSMContext):
         await message.answer("❌ To'g'ri raqam kiriting! Masalan: 0.10")
 
 
+@router.callback_query(F.data == "admin_set_min_refs")
+async def admin_set_min_refs(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    current = await get_min_referrals()
+    await state.set_state(AdminStates.set_min_referrals)
+    await call.message.edit_text(
+        f"👥 <b>Minimum referral soni</b>\n\n"
+        f"Hozirgi: <b>{current} ta</b>\n\n"
+        f"Gift olish uchun kerakli minimum referral sonini kiriting:\n"
+        f"(0 kiritsangiz — referral sharti bo'lmaydi)",
+        reply_markup=back_kb("admin_panel"), parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.message(AdminStates.set_min_referrals)
+async def process_min_referrals(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        val = int(message.text.strip())
+        if val < 0:
+            raise ValueError
+        await set_setting("min_referrals", val)
+        await admin_log(ADMIN_ID, "set_min_referrals", str(val))
+        await state.clear()
+        text = f"✅ Min referral: <b>{val} ta</b>" if val > 0 else "✅ Referral sharti <b>o'chirildi</b>"
+        await message.answer(text, reply_markup=admin_keyboard(), parse_mode="HTML")
+    except Exception:
+        await message.answer("❌ To'g'ri son kiriting! Masalan: 3")
+
+
 @router.callback_query(F.data == "admin_add_balance")
 async def admin_add_balance(call: CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -1398,6 +1453,7 @@ async def admin_stats(call: CallbackQuery):
     total_users, total_balance, total_credits, total_gifts, pending_gifts = await get_stats()
     ref_stars = await get_setting("referral_stars")
     sub_stars = await get_setting("subscribe_stars")
+    min_refs  = await get_min_referrals()
     await call.message.edit_text(
         f"📊 <b>Statistika</b>\n\n"
         f"👥 Foydalanuvchilar: <b>{total_users}</b>\n"
@@ -1406,7 +1462,7 @@ async def admin_stats(call: CallbackQuery):
         f"🎁 Bajarilgan buyurtmalar: <b>{total_gifts}</b>\n"
         f"⏳ Kutayotgan buyurtmalar: <b>{pending_gifts}</b>\n\n"
         f"⚙️ Referral: <b>{ref_stars}⭐</b> | Obuna: <b>{sub_stars}⭐</b>\n"
-        f"👥 Gift uchun min referral: <b>{MIN_REFERRALS_FOR_GIFT} ta</b>",
+        f"👥 Gift uchun min referral: <b>{min_refs} ta</b>",
         reply_markup=back_kb("admin_panel"), parse_mode="HTML"
     )
     await call.answer()
