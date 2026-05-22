@@ -14,7 +14,7 @@ from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
     ChatJoinRequest, TelegramObject,
 )
-from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramNotFound
+from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramNotFound, TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -97,13 +97,7 @@ async def init_db():
         {"$setOnInsert": {"key": "min_referrals", "value": "3"}},
         upsert=True
     )
-    _uzs_default  = json.dumps([[50,25000],[100,50000],[200,100000],[300,150000],[500,250000]])
     _pubg_default = json.dumps([[15,5],[30,10],[60,25],[120,50],[240,100]])
-    await settings_col.update_one(
-        {"key": "uzs_variants"},
-        {"$setOnInsert": {"key": "uzs_variants", "value": _uzs_default}},
-        upsert=True
-    )
     await settings_col.update_one(
         {"key": "pubg_variants"},
         {"$setOnInsert": {"key": "pubg_variants", "value": _pubg_default}},
@@ -555,7 +549,6 @@ class AdminStates(StatesGroup):
     set_referral_stars   = State()
     set_subscribe_stars  = State()
     set_min_referrals    = State()
-    set_uzs_variant      = State()
     set_pubg_variant     = State()
     broadcast            = State()
     add_balance_input    = State()
@@ -566,8 +559,6 @@ class AdminStates(StatesGroup):
 
 class UserStates(StatesGroup):
     support_message   = State()
-    uzs_card          = State()
-    uzs_card_name     = State()
     pubg_id           = State()
     pubg_nick         = State()
     transfer_amount   = State()
@@ -612,10 +603,7 @@ def main_menu(user_id: int) -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton(text="🎁 Gift olish",       callback_data="buy_gift")],
         [InlineKeyboardButton(text="📢 Kanallarga obuna", callback_data="channels")],
-        [
-            InlineKeyboardButton(text="💵 So'mga almashtirish", callback_data="exchange_uzs"),
-            InlineKeyboardButton(text="🎮 PUBG UC",             callback_data="exchange_pubg"),
-        ],
+        [InlineKeyboardButton(text="🎮 PUBG UC",             callback_data="exchange_pubg")],
         [InlineKeyboardButton(text="📋 Transaksiyalar",   callback_data="transactions")],
         [
             InlineKeyboardButton(text="🏆 Reyting",        callback_data="leaderboard"),
@@ -641,7 +629,6 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="💸 Balans ayirish",       callback_data="admin_deduct_balance")],
         [InlineKeyboardButton(text="📦 Gift buyurtmalar",       callback_data="admin_orders")],
         [InlineKeyboardButton(text="💱 Almashtirish buyurtmalari", callback_data="admin_exc_orders")],
-        [InlineKeyboardButton(text="💵 UZS variantlari",       callback_data="admin_uzs_config")],
         [InlineKeyboardButton(text="🎮 PUBG variantlari",      callback_data="admin_pubg_config")],
         [InlineKeyboardButton(text="🔍 Foydalanuvchi qidirish", callback_data="admin_search_user")],
         [InlineKeyboardButton(text="📊 Statistika",           callback_data="admin_stats")],
@@ -875,7 +862,6 @@ async def about_handler(call: CallbackQuery):
         f"⭐ Stars yig'ing → kerakli miqdorga yeting\n\n"
         f"<b>Nimalarga almashtirasiz?</b>\n"
         f"🎁 Telegram Gift (15⭐ dan)\n"
-        f"💵 O'zbek so'mi (UZS) — kartaga\n"
         f"🎮 PUBG UC — ID orqali\n\n"
         f"<b>Shartlar:</b>\n"
         f"👥 Gift uchun kamida <b>{min_refs} ta referral</b>\n"
@@ -1589,144 +1575,6 @@ async def done_order(call: CallbackQuery):
     await call.answer("✅ Buyurtma bajarildi!")
 
 
-# ===================== UZS EXCHANGE =====================
-
-@router.callback_query(F.data == "exchange_uzs")
-async def exchange_uzs_menu(call: CallbackQuery):
-    user_id  = call.from_user.id
-    balance  = await get_balance(user_id)
-    variants = await get_variants("uzs")
-    if not variants or all(v[0] == 0 for v in variants):
-        await call.answer("Hozircha UZS almashtirish mavjud emas!", show_alert=True)
-        return
-    buttons = []
-    for i, (stars, uzs) in enumerate(variants):
-        if stars <= 0:
-            continue
-        mark = "✅" if balance >= stars else "❌"
-        buttons.append([InlineKeyboardButton(
-            text=f"{mark} {stars}⭐ = {uzs:,} UZS",
-            callback_data=f"uzs_buy_{i}"
-        )])
-    buttons.append([InlineKeyboardButton(text="🔙 Ortga", callback_data="back_main")])
-    await call.message.edit_text(
-        f"💵 <b>Starlarni so'mga almashtirish</b>\n\n"
-        f"💰 Balansingiz: <b>{balance}⭐</b>\n\n"
-        f"✅ = Yetarli | ❌ = Stars kam\n\n"
-        f"Variantni tanlang 👇",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-        parse_mode="HTML"
-    )
-    await call.answer()
-
-
-@router.callback_query(F.data.startswith("uzs_buy_"))
-async def uzs_select_variant(call: CallbackQuery, state: FSMContext):
-    try:
-        slot = int(call.data.split("_")[2])
-    except (ValueError, IndexError):
-        await call.answer("❌ Xato!", show_alert=True)
-        return
-    variants = await get_variants("uzs")
-    if slot >= len(variants):
-        await call.answer("Variant topilmadi!", show_alert=True)
-        return
-    stars, uzs = variants[slot]
-    if stars <= 0:
-        await call.answer("Bu variant faol emas!", show_alert=True)
-        return
-    balance = await get_balance(call.from_user.id)
-    if balance < stars:
-        await call.answer(f"❌ Stars yetarli emas!\nKerak: {stars}⭐\nBalans: {balance}⭐", show_alert=True)
-        return
-    await state.update_data(uzs_stars=stars, uzs_amount=uzs)
-    await state.set_state(UserStates.uzs_card)
-    await call.message.edit_text(
-        f"💵 <b>{stars}⭐ → {uzs:,} UZS</b>\n\n"
-        f"Karta raqamingizni yuboring:\n"
-        f"<code>8600 XXXX XXXX XXXX</code>\n\n"
-        f"Bekor qilish: /start",
-        reply_markup=back_kb("exchange_uzs"), parse_mode="HTML"
-    )
-    await call.answer()
-
-
-@router.message(UserStates.uzs_card)
-async def uzs_get_card(message: Message, state: FSMContext):
-    card = message.text.strip().replace(" ", "").replace("-", "") if message.text else ""
-    if not card.isdigit() or len(card) != 16:
-        await message.answer("❌ Karta raqami 16 ta raqamdan iborat bo'lishi kerak!\nQaytadan yuboring:")
-        return
-    formatted = f"{card[:4]} {card[4:8]} {card[8:12]} {card[12:]}"
-    await state.update_data(uzs_card=formatted)
-    await state.set_state(UserStates.uzs_card_name)
-    await message.answer(
-        f"✅ Karta: <code>{formatted}</code>\n\n"
-        f"Karta egasining ismini yuboring:\n"
-        f"<i>Masalan: ALISHER KARIMOV</i>",
-        parse_mode="HTML"
-    )
-
-
-@router.message(UserStates.uzs_card_name)
-async def uzs_get_card_name(message: Message, state: FSMContext):
-    name = message.text.strip() if message.text else ""
-    if len(name) < 3 or len(name) > 60:
-        await message.answer("❌ Ism noto'g'ri. Qaytadan yuboring:")
-        return
-    data      = await state.get_data()
-    stars     = data["uzs_stars"]
-    uzs       = data["uzs_amount"]
-    card      = data["uzs_card"]
-    user_id   = message.from_user.id
-    username  = message.from_user.username or ""
-    full_name = message.from_user.full_name or ""
-    uname     = f"@{username}" if username else full_name
-
-    ok = await deduct_balance(user_id, stars, f"UZS almashtirish: {stars}⭐ → {uzs:,} UZS")
-    if not ok:
-        await state.clear()
-        await message.answer("❌ Stars yetarli emas! Balans o'zgardi.")
-        return
-
-    order_id = await add_exchange_order(
-        user_id, username, full_name, "uzs", stars, uzs, card, name
-    )
-    await state.clear()
-
-    try:
-        await bot.send_message(
-            ADMIN_ID,
-            f"💵 <b>UZS almashtirish so'rovi!</b>\n\n"
-            f"🆔 Buyurtma: <code>{order_id}</code>\n"
-            f"👤 {uname} | <code>{user_id}</code>\n"
-            f"⭐ {stars}⭐ → <b>{uzs:,} UZS</b>\n"
-            f"💳 Karta: <code>{card}</code>\n"
-            f"👤 Egasi: <b>{name}</b>\n"
-            f"🕐 {datetime.now(TIMEZONE).strftime('%H:%M')}",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(
-                    text="✅ Pul yuborildi",
-                    callback_data=f"done_exc|{order_id}|{user_id}"
-                )
-            ]]),
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logger.error(f"Admin ga UZS buyurtma yuborishda xato: {e}")
-
-    new_balance = await get_balance(user_id)
-    await message.answer(
-        f"✅ <b>So'rov qabul qilindi!</b>\n\n"
-        f"💵 <b>{stars}⭐ → {uzs:,} UZS</b>\n"
-        f"💳 {card}\n"
-        f"👤 {name}\n\n"
-        f"⏳ Admin tez orada kartangizga pul yuboradi.\n"
-        f"💰 Qolgan balans: <b>{new_balance}⭐</b>",
-        reply_markup=back_kb(), parse_mode="HTML"
-    )
-
-
 # ===================== PUBG UC EXCHANGE =====================
 
 @router.callback_query(F.data == "exchange_pubg")
@@ -1888,14 +1736,7 @@ async def done_exchange(call: CallbackQuery):
     await complete_exchange_order(order_id)
     await admin_log(ADMIN_ID, "complete_exchange", f"order_id={order_id}, type={order['type']}")
 
-    if order["type"] == "uzs":
-        user_msg = (
-            f"✅ <b>Pul kartangizga yuborildi!</b>\n\n"
-            f"💵 {order['stars']}⭐ → <b>{order['amount']:,} UZS</b>\n"
-            f"💳 {order['detail1']}"
-        )
-    else:
-        user_msg = (
+    user_msg = (
             f"✅ <b>PUBG UC hisobingizga yuborildi!</b>\n\n"
             f"🎮 {order['stars']}⭐ → <b>{order['amount']} UC</b>\n"
             f"🆔 ID: {order['detail1']}"
@@ -2252,12 +2093,8 @@ async def admin_exc_orders_handler(call: CallbackQuery):
     for o in pending:
         oid   = str(o["_id"])
         uname = f"@{o['username']}" if o.get("username") else o.get("full_name", "")
-        if o["type"] == "uzs":
-            label = f"💵 {uname} — {o['stars']}⭐ → {o['amount']:,} UZS"
-            text += f"💵 {uname} | {o['stars']}⭐ → {o['amount']:,} UZS | 💳 {o['detail1']} ({o['detail2']})\n"
-        else:
-            label = f"🎮 {uname} — {o['stars']}⭐ → {o['amount']} UC"
-            text += f"🎮 {uname} | {o['stars']}⭐ → {o['amount']} UC | ID: {o['detail1']} ({o['detail2']})\n"
+        label = f"🎮 {uname} — {o['stars']}⭐ → {o['amount']} UC"
+        text += f"🎮 {uname} | {o['stars']}⭐ → {o['amount']} UC | ID: {o['detail1']} ({o['detail2']})\n"
         buttons.append([InlineKeyboardButton(
             text=f"✅ {label}",
             callback_data=f"done_exc|{oid}|{o['user_id']}"
@@ -2270,27 +2107,13 @@ async def admin_exc_orders_handler(call: CallbackQuery):
 
 
 def _variants_keyboard(vtype: str, variants: list, back_cb: str) -> InlineKeyboardMarkup:
-    unit = "UZS" if vtype == "uzs" else "UC"
+    unit = "UC"
     buttons = []
     for i, (stars, amount) in enumerate(variants):
         label = f"Slot {i+1}: {stars}⭐ = {amount:,} {unit}" if stars > 0 else f"Slot {i+1}: (bo'sh)"
         buttons.append([InlineKeyboardButton(text=f"✏️ {label}", callback_data=f"{vtype}_slot_{i}")])
     buttons.append([InlineKeyboardButton(text="🔙 Ortga", callback_data=back_cb)])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-@router.callback_query(F.data == "admin_uzs_config")
-async def admin_uzs_config(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        return
-    variants = await get_variants("uzs")
-    await call.message.edit_text(
-        "💵 <b>UZS variantlarini sozlash</b>\n\n"
-        "O'zgartirish uchun slotga bosing:",
-        reply_markup=_variants_keyboard("uzs", variants, "admin_panel"),
-        parse_mode="HTML"
-    )
-    await call.answer()
 
 
 @router.callback_query(F.data == "admin_pubg_config")
@@ -2303,31 +2126,6 @@ async def admin_pubg_config(call: CallbackQuery):
         "O'zgartirish uchun slotga bosing:",
         reply_markup=_variants_keyboard("pubg", variants, "admin_panel"),
         parse_mode="HTML"
-    )
-    await call.answer()
-
-
-@router.callback_query(F.data.startswith("uzs_slot_"))
-async def uzs_slot_edit(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id != ADMIN_ID:
-        return
-    try:
-        slot = int(call.data.split("_")[2])
-    except (ValueError, IndexError):
-        await call.answer("❌ Xato!", show_alert=True)
-        return
-    variants = await get_variants("uzs")
-    cur = variants[slot] if slot < len(variants) else [0, 0]
-    await state.update_data(edit_vtype="uzs", edit_slot=slot)
-    await state.set_state(AdminStates.set_uzs_variant)
-    await call.message.edit_text(
-        f"💵 <b>UZS Slot {slot+1}</b>\n\n"
-        f"Hozirgi: <b>{cur[0]}⭐ = {cur[1]:,} UZS</b>\n\n"
-        f"Yangi qiymatni kiriting:\n"
-        f"<code>stars uzs_miqdor</code>\n"
-        f"Masalan: <code>100 50000</code>\n\n"
-        f"O'chirish uchun: <code>0 0</code>",
-        reply_markup=back_kb("admin_uzs_config"), parse_mode="HTML"
     )
     await call.answer()
 
@@ -2355,31 +2153,6 @@ async def pubg_slot_edit(call: CallbackQuery, state: FSMContext):
         reply_markup=back_kb("admin_pubg_config"), parse_mode="HTML"
     )
     await call.answer()
-
-
-@router.message(AdminStates.set_uzs_variant)
-async def process_uzs_variant(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-    try:
-        parts  = message.text.strip().split()
-        stars  = int(parts[0])
-        amount = float(parts[1])
-        if stars < 0 or amount < 0:
-            raise ValueError
-    except Exception:
-        await message.answer("❌ Format: <code>stars uzs_miqdor</code>\nMasalan: <code>100 50000</code>", parse_mode="HTML")
-        return
-    data = await state.get_data()
-    slot = data["edit_slot"]
-    await set_variant_slot("uzs", slot, stars, amount)
-    await admin_log(ADMIN_ID, "set_uzs_variant", f"slot={slot}, stars={stars}, uzs={amount}")
-    await state.clear()
-    label = f"{stars}⭐ = {amount:,.0f} UZS" if stars > 0 else "o'chirildi"
-    await message.answer(
-        f"✅ UZS Slot {slot+1}: <b>{label}</b>",
-        reply_markup=admin_keyboard(), parse_mode="HTML"
-    )
 
 
 @router.message(AdminStates.set_pubg_variant)
@@ -3025,6 +2798,23 @@ async def check_channel_health():
                 except Exception as e:
                     logger.warning(f"Kanal health check xato ({cid_str}): {e}")
 
+                # Maxfiy invite link eskirganligini tekshirish (t.me/+HASH)
+                if not problem and channel_link and "/+" in channel_link:
+                    try:
+                        hash_part = channel_link.split("/+")[-1].strip("/")
+                        await bot.get_chat(f"+{hash_part}")
+                    except TelegramBadRequest as e:
+                        err = str(e).lower()
+                        if "expired" in err or "invalid" in err or "revoked" in err:
+                            problem = (
+                                f"🔗 <b>Kanal havolasi eskirgan!</b>\n\n"
+                                f"📢 Kanal: <b>{channel_name}</b>\n"
+                                f"<code>{channel_link}</code>\n\n"
+                                f"Yangi invite link yarating va botga yangilang."
+                            )
+                    except Exception:
+                        pass
+
                 if problem:
                     await channels.update_one(
                         {"channel_id": cid_str},
@@ -3129,4 +2919,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-        
