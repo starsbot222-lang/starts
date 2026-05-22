@@ -9,6 +9,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    ChatJoinRequest,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -52,8 +53,9 @@ transactions     = mdb["transactions"]
 orders           = mdb["orders"]
 admin_logs       = mdb["admin_logs"]
 referral_hourly  = mdb["referral_hourly"]
-support_cooldown = mdb["support_cooldown"]
-channel_bonus    = mdb["user_channel_bonus"]
+support_cooldown  = mdb["support_cooldown"]
+channel_bonus     = mdb["user_channel_bonus"]
+join_requests_col = mdb["join_requests"]
 
 
 async def init_db():
@@ -91,6 +93,9 @@ async def init_db():
     await support_cooldown.create_index(
         "last_sent_at",
         expireAfterSeconds=7200
+    )
+    await join_requests_col.create_index(
+        [("user_id", 1), ("channel_id", 1)], unique=True
     )
     logger.info("✅ Indekslar tayyor!")
 
@@ -305,16 +310,13 @@ async def is_member(channel_id_str: str, user_id: int) -> bool:
     try:
         cid = int(channel_id_str)
         member = await bot.get_chat_member(cid, user_id)
-        return member.status in [
-            "member", 
-            "administrator", 
-            "creator", 
-            "restricted",
-            "kicked"  # emas
-        ]
+        if member.status in ["member", "administrator", "creator", "restricted"]:
+            return True
     except Exception as e:
         logger.warning(f"get_chat_member xato {channel_id_str}: {e}")
-        return False
+    # Zaявka (join request) yuborgan bo'lsa ham a'zo sifatida qabul qilamiz
+    req = await join_requests_col.find_one({"user_id": user_id, "channel_id": channel_id_str})
+    return req is not None
 
 async def check_subscription(user_id: int):
     chs = await get_channels()
@@ -351,6 +353,7 @@ GIFTS = [
 # ===================== STATES =====================
 class AdminStates(StatesGroup):
     add_channel_link     = State()
+    add_channel_id       = State()
     set_referral_stars   = State()
     set_subscribe_stars  = State()
     broadcast            = State()
@@ -488,6 +491,23 @@ async def render_channels_menu(user_id: int, message) -> None:
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode="HTML"
     )
+
+
+# ===================== JOIN REQUEST HANDLER =====================
+
+@router.chat_join_request()
+async def on_join_request(event: ChatJoinRequest):
+    user_id        = event.from_user.id
+    channel_id_str = str(event.chat.id)
+    try:
+        await join_requests_col.update_one(
+            {"user_id": user_id, "channel_id": channel_id_str},
+            {"$set": {"created_at": datetime.utcnow()}},
+            upsert=True
+        )
+        logger.info(f"Join request saqlandi: user={user_id}, channel={channel_id_str}")
+    except Exception as e:
+        logger.error(f"Join request saqlashda xato: {e}")
 
 
 # ===================== START HANDLER =====================
@@ -1103,18 +1123,74 @@ async def admin_add_channel_start(call: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminStates.add_channel_link)
     await call.message.edit_text(
-        "➕ <b>Kanal qo'shish</b>\n\n"
-        "1-qadam: Kanal invite linkini yuboring\n"
-        "<code>https://t.me/+xxxxxxxxxx</code>\n\n"
-        "2-qadam: Kanal ID sini yuboring\n"
-        "<code>-1003928551808</code>\n\n"
-        "⚠️ Kanalda <b>Approve new members</b> yoqilgan bo'lsin!\n"
-        "⚠️ Bot kanalda <b>admin</b> bo'lishi kerak!",
+        "➕ <b>Kanal qo'shish — 1-qadam</b>\n\n"
+        "Kanal linkini yuboring:\n"
+        "• Oddiy kanal: <code>https://t.me/kanalnom</code>\n"
+        "• Maxfiy kanal: <code>https://t.me/+xxxxxxxxxx</code>\n\n"
+        "⚠️ Bot kanalda <b>admin</b> bo'lishi kerak!\n"
+        "⚠️ Zaявka kanal bo'lsa — bot <b>Approve new members</b> huquqiga ega bo'lsin!",
         reply_markup=back_kb("admin_panel"),
         parse_mode="HTML"
     )
     await call.answer()
-v
+
+
+@router.message(AdminStates.add_channel_link)
+async def process_add_channel_link(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    link = message.text.strip() if message.text else ""
+    if not link.startswith("https://t.me/"):
+        await message.answer(
+            "❌ Noto'g'ri link!\n\nMasalan: <code>https://t.me/+xxxxxxxxxx</code> yoki <code>https://t.me/kanalnom</code>",
+            parse_mode="HTML"
+        )
+        return
+    await state.update_data(channel_link=link)
+    await state.set_state(AdminStates.add_channel_id)
+    await message.answer(
+        "✅ Link qabul qilindi!\n\n"
+        "Endi kanal ID sini yuboring:\n"
+        "<code>-1003928551808</code>\n\n"
+        "📌 Kanal ID ni bilish uchun: @username_to_id_bot",
+        parse_mode="HTML"
+    )
+
+
+@router.message(AdminStates.add_channel_id)
+async def process_add_channel_id(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    channel_id = message.text.strip() if message.text else ""
+    if not channel_id.lstrip("-").isdigit():
+        await message.answer("❌ Kanal ID noto'g'ri! Masalan: <code>-1003928551808</code>", parse_mode="HTML")
+        return
+    data = await state.get_data()
+    link = data.get("channel_link", "")
+    try:
+        chat = await bot.get_chat(int(channel_id))
+        name = chat.title or channel_id
+    except Exception as e:
+        logger.warning(f"get_chat xato {channel_id}: {e}")
+        await message.answer(
+            "❌ Bot kanalda <b>admin</b> emas yoki ID noto'g'ri!\n\n"
+            "Bot kanalga admin qiling, keyin qaytadan urinib ko'ring.",
+            reply_markup=back_kb("admin_panel"), parse_mode="HTML"
+        )
+        await state.clear()
+        return
+    await add_channel(channel_id, name, link)
+    await admin_log(ADMIN_ID, "add_channel", f"id={channel_id}, name={name}")
+    await state.clear()
+    await message.answer(
+        f"✅ Kanal qo'shildi!\n\n"
+        f"📢 <b>{name}</b>\n"
+        f"🆔 <code>{channel_id}</code>\n"
+        f"🔗 {link}",
+        reply_markup=admin_keyboard(), parse_mode="HTML"
+    )
+
+
 @router.callback_query(F.data == "admin_remove_channel")
 async def admin_remove_channel_handler(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
@@ -1343,7 +1419,7 @@ async def show_users_page(message, top_list: list, page: int, edit: bool = True)
     end      = min(start + per_page, total)
     chunk    = top_list[start:end]
 
-    text = f"👥 <b>Top {total} foydalanuvchi ({start+1}–{end}):</b>\n\n"x`
+    text = f"👥 <b>Top {total} foydalanuvchi ({start+1}–{end}):</b>\n\n"
     for i, u in enumerate(chunk, start + 1):
         uname = f"@{u['username']}" if u.get("username") else u.get("full_name", "Noma'lum")
         bal   = round(u.get("balance", 0), 2)
