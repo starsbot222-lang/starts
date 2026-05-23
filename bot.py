@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import pytz
 
 from aiohttp import web
@@ -72,6 +72,8 @@ channel_bonus     = mdb["user_channel_bonus"]
 join_requests_col = mdb["join_requests"]
 exchange_orders   = mdb["exchange_orders"]
 transfers_col     = mdb["transfers"]
+contests          = mdb["contests"]
+contest_refs_col  = mdb["contest_refs"]
 
 
 async def init_db():
@@ -134,6 +136,12 @@ async def init_db():
     await exchange_orders.create_index("created_at")
     await transfers_col.create_index("token", unique=True)
     await transfers_col.create_index("from_user_id")
+    await contests.create_index("status")
+    await contests.create_index("token", sparse=True, unique=True)
+    await contest_refs_col.create_index(
+        [("contest_id", 1), ("referred_id", 1)], unique=True
+    )
+    await contest_refs_col.create_index([("contest_id", 1), ("referrer_id", 1)])
     logger.info("✅ Indekslar tayyor!")
 
 
@@ -555,6 +563,8 @@ class AdminStates(StatesGroup):
     deduct_balance_input = State()
     search_user          = State()
     send_user_msg        = State()
+    slot_contest_setup   = State()
+    ref_contest_setup    = State()
 
 
 class UserStates(StatesGroup):
@@ -631,6 +641,10 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="💱 Almashtirish buyurtmalari", callback_data="admin_exc_orders")],
         [InlineKeyboardButton(text="🎮 PUBG variantlari",      callback_data="admin_pubg_config")],
         [InlineKeyboardButton(text="🔍 Foydalanuvchi qidirish", callback_data="admin_search_user")],
+        [
+            InlineKeyboardButton(text="🎰 Slot konkurs",    callback_data="admin_slot_contest"),
+            InlineKeyboardButton(text="🏆 Ref konkurs",     callback_data="admin_ref_contest"),
+        ],
         [InlineKeyboardButton(text="📊 Statistika",           callback_data="admin_stats")],
         [InlineKeyboardButton(text="📣 Xabar yuborish",       callback_data="admin_broadcast")],
         [InlineKeyboardButton(text="👥 Foydalanuvchilar",     callback_data="admin_users")],
@@ -755,12 +769,15 @@ async def cmd_start(message: Message):
         return
 
     args = message.text.split()
-    referred_by = None
+    referred_by    = None
     transfer_token = None
+    slot_token     = None
     if len(args) > 1:
         arg = args[1]
         if arg.startswith("tr_"):
             transfer_token = arg[3:]
+        elif arg.startswith("slot_"):
+            slot_token = arg[5:]
         else:
             try:
                 ref_id = int(arg)
@@ -790,6 +807,22 @@ async def cmd_start(message: Message):
                 )
             except Exception:
                 pass
+            # Faol referral konkursga qayd qilish
+            ref_contest = await contests.find_one({"type": "referral", "status": "active"})
+            if ref_contest:
+                try:
+                    await contest_refs_col.insert_one({
+                        "contest_id": ref_contest["_id"],
+                        "referrer_id": referred_by,
+                        "referred_id": user_id,
+                        "created_at": datetime.now(timezone.utc)
+                    })
+                except DuplicateKeyError:
+                    pass
+
+    if slot_token:
+        await _handle_slot_join(message, user_id, username, full_name, slot_token)
+        return
 
     if transfer_token:
         tr = await get_transfer(transfer_token)
@@ -2749,6 +2782,334 @@ async def process_broadcast(message: Message, state: FSMContext):
     await message.answer("🏠 Admin panel:", reply_markup=admin_keyboard())
 
 
+# ===================== KONKURS (CONTESTS) =====================
+
+async def _finalize_slot_contest(contest: dict):
+    """Slot to'lganda random g'oliblarni tanlaydi va adminga xabar beradi."""
+    import random
+    cid        = contest["_id"]
+    parts      = contest["participants"]
+    n_winners  = contest.get("winners_count", 3)
+    winners    = random.sample(parts, min(n_winners, len(parts)))
+
+    await contests.update_one(
+        {"_id": cid},
+        {"$set": {"status": "finished", "winners": winners}}
+    )
+    lines = [f"🎰 <b>Slot Konkurs Yakunlandi!</b>\n"]
+    lines.append(f"👥 Qatnashchilar: <b>{len(parts)} ta</b>")
+    lines.append(f"🏆 G'oliblar ({len(winners)} ta):\n")
+    for i, w in enumerate(winners, 1):
+        uname = f"@{w['username']}" if w.get("username") else w.get("full_name", "—")
+        lines.append(f"{i}. {uname} — <code>{w['user_id']}</code>")
+    text = "\n".join(lines)
+    try:
+        await bot.send_message(ADMIN_ID, text, parse_mode="HTML")
+    except Exception:
+        pass
+
+
+async def _handle_slot_join(message, user_id: int, username: str, full_name: str, token: str):
+    """Foydalanuvchi slot konkurs havolasiga kirganida chaqiriladi."""
+    contest = await contests.find_one({"token": token, "type": "slot", "status": "active"})
+    if not contest:
+        await message.answer(
+            "❌ Bu konkurs mavjud emas yoki tugagan.",
+            reply_markup=main_menu(user_id), parse_mode="HTML"
+        )
+        return
+
+    already = any(p["user_id"] == user_id for p in contest.get("participants", []))
+    if already:
+        filled = len(contest["participants"])
+        total  = contest["total_slots"]
+        await message.answer(
+            f"ℹ️ Siz allaqachon bu konkursda qatnashyapsiz.\n"
+            f"📊 To'lgan: {filled}/{total}",
+            reply_markup=main_menu(user_id), parse_mode="HTML"
+        )
+        return
+
+    participant = {
+        "user_id":   user_id,
+        "username":  username,
+        "full_name": full_name,
+        "joined_at": datetime.now(timezone.utc)
+    }
+    updated = await contests.find_one_and_update(
+        {"_id": contest["_id"], "status": "active"},
+        {"$push": {"participants": participant}},
+        return_document=ReturnDocument.AFTER
+    )
+    if not updated:
+        await message.answer("❌ Konkurs tugadi.", reply_markup=main_menu(user_id), parse_mode="HTML")
+        return
+
+    filled = len(updated["participants"])
+    total  = updated["total_slots"]
+    await message.answer(
+        f"✅ <b>Konkursga qo'shildingiz!</b>\n\n"
+        f"🎰 Slot: <b>{filled}/{total}</b>\n"
+        f"G'oliblar random tanlanadi. Omad! 🍀",
+        reply_markup=main_menu(user_id), parse_mode="HTML"
+    )
+
+    if filled >= total:
+        await _finalize_slot_contest(updated)
+
+
+# --- Admin: Slot konkurs yaratish ---
+
+@router.callback_query(F.data == "admin_slot_contest")
+async def admin_slot_contest(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    active = await contests.find_one({"type": "slot", "status": "active"})
+    if active:
+        filled = len(active.get("participants", []))
+        total  = active["total_slots"]
+        token  = active["token"]
+        bot_info = await bot.get_me()
+        link   = f"https://t.me/{bot_info.username}?start=slot_{token}"
+        await call.message.edit_text(
+            f"🎰 <b>Faol Slot Konkurs</b>\n\n"
+            f"📊 To'lgan: <b>{filled}/{total}</b>\n"
+            f"🔗 Havola:\n<code>{link}</code>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Konkursni bekor qilish", callback_data=f"stop_slot_{str(active['_id'])}")],
+                [InlineKeyboardButton(text="🔙 Admin panel",            callback_data="admin_panel")],
+            ]),
+            parse_mode="HTML"
+        )
+    else:
+        await state.set_state(AdminStates.slot_contest_setup)
+        await call.message.edit_text(
+            "🎰 <b>Yangi Slot Konkurs</b>\n\n"
+            "Format: <code>SLOTLAR G'OLIBLAR</code>\n"
+            "Masalan: <code>100 3</code>\n"
+            "(100 slot, 3 ta g'olib)\n\n"
+            "<i>Bekor qilish: /cancel</i>",
+            reply_markup=back_kb("admin_panel"), parse_mode="HTML"
+        )
+    await call.answer()
+
+
+@router.message(AdminStates.slot_contest_setup)
+async def process_slot_contest(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        parts     = message.text.strip().split()
+        total     = int(parts[0])
+        n_winners = int(parts[1]) if len(parts) > 1 else 3
+        if total < 2 or n_winners < 1 or n_winners >= total:
+            raise ValueError
+    except (ValueError, IndexError):
+        await message.answer("❌ Format: <code>SLOTLAR G'OLIBLAR</code>\nMasalan: <code>100 3</code>", parse_mode="HTML")
+        return
+
+    await state.clear()
+    token = secrets.token_hex(4)
+    await contests.insert_one({
+        "type":          "slot",
+        "token":         token,
+        "total_slots":   total,
+        "winners_count": n_winners,
+        "participants":  [],
+        "winners":       [],
+        "status":        "active",
+        "created_at":    datetime.now(timezone.utc)
+    })
+    bot_info = await bot.get_me()
+    link = f"https://t.me/{bot_info.username}?start=slot_{token}"
+    await message.answer(
+        f"✅ <b>Slot Konkurs yaratildi!</b>\n\n"
+        f"🎰 Slotlar: <b>{total} ta</b>\n"
+        f"🏆 G'oliblar: <b>{n_winners} ta</b>\n\n"
+        f"🔗 Havola:\n<code>{link}</code>\n\n"
+        f"Havolani foydalanuvchilarga yuboring.",
+        reply_markup=admin_keyboard(), parse_mode="HTML"
+    )
+    await admin_log(ADMIN_ID, "slot_contest_created", f"slots={total}, winners={n_winners}")
+
+
+@router.callback_query(F.data.startswith("stop_slot_"))
+async def stop_slot_contest(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    contest_id = call.data[len("stop_slot_"):]
+    await contests.update_one({"_id": ObjectId(contest_id)}, {"$set": {"status": "cancelled"}})
+    await call.message.edit_text("❌ Konkurs bekor qilindi.", reply_markup=admin_keyboard())
+    await call.answer("Bekor qilindi!")
+
+
+# --- Admin: Referral konkurs yaratish ---
+
+@router.callback_query(F.data == "admin_ref_contest")
+async def admin_ref_contest(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    active = await contests.find_one({"type": "referral", "status": "active"})
+    if active:
+        end_at   = ensure_utc(active["end_at"]).astimezone(TIMEZONE)
+        end_str  = end_at.strftime("%d.%m.%Y %H:%M")
+        pipeline = [
+            {"$match": {"contest_id": active["_id"]}},
+            {"$group": {"_id": "$referrer_id", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+            {"$limit": 5}
+        ]
+        top = await contest_refs_col.aggregate(pipeline).to_list(5)
+        lines = [f"🏆 <b>Faol Referral Konkurs</b>\n", f"⏰ Tugash: <b>{end_str}</b>\n"]
+        if top:
+            lines.append("<b>Hozirgi reyting:</b>")
+            medals = ["🥇","🥈","🥉","4️⃣","5️⃣"]
+            for i, row in enumerate(top):
+                u = await users.find_one({"user_id": row["_id"]}, {"full_name":1,"username":1})
+                name = (f"@{u['username']}" if u and u.get("username") else (u or {}).get("full_name","?")) if u else str(row["_id"])
+                lines.append(f"{medals[i]} {name} — {row['count']} ta")
+        else:
+            lines.append("Hali hech kim taklif qilmagan.")
+        await call.message.edit_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🏁 Konkursni yakunlash", callback_data=f"finish_ref_{str(active['_id'])}")],
+                [InlineKeyboardButton(text="❌ Bekor qilish",        callback_data=f"stop_ref_{str(active['_id'])}")],
+                [InlineKeyboardButton(text="🔙 Admin panel",         callback_data="admin_panel")],
+            ]),
+            parse_mode="HTML"
+        )
+    else:
+        await state.set_state(AdminStates.ref_contest_setup)
+        now_str = datetime.now(TIMEZONE).strftime("%d.%m.%Y %H:%M")
+        await call.message.edit_text(
+            f"🏆 <b>Yangi Referral Konkurs</b>\n\n"
+            f"Konkurs qachon tugashini kiriting:\n"
+            f"• Sana/vaqt: <code>DD.MM.YYYY HH:MM</code>\n"
+            f"• Yoki soatlar soni: <code>24</code>\n\n"
+            f"Hozirgi vaqt: <b>{now_str}</b>\n\n"
+            f"<i>Bekor qilish: /cancel</i>",
+            reply_markup=back_kb("admin_panel"), parse_mode="HTML"
+        )
+    await call.answer()
+
+
+@router.message(AdminStates.ref_contest_setup)
+async def process_ref_contest(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    text = message.text.strip() if message.text else ""
+    end_at = None
+    try:
+        if text.isdigit():
+            hours  = int(text)
+            end_at = datetime.now(timezone.utc) + timedelta(hours=hours)
+        else:
+            naive  = datetime.strptime(text, "%d.%m.%Y %H:%M")
+            end_at = TIMEZONE.localize(naive).astimezone(timezone.utc)
+    except Exception:
+        await message.answer(
+            "❌ Format noto'g'ri.\n"
+            "Misol: <code>01.06.2025 20:00</code> yoki <code>24</code> (soat)",
+            parse_mode="HTML"
+        )
+        return
+
+    await state.clear()
+    await contests.insert_one({
+        "type":       "referral",
+        "status":     "active",
+        "end_at":     end_at,
+        "created_at": datetime.now(timezone.utc)
+    })
+    end_local = end_at.astimezone(TIMEZONE).strftime("%d.%m.%Y %H:%M")
+    await message.answer(
+        f"✅ <b>Referral Konkurs boshlandi!</b>\n\n"
+        f"⏰ Tugash vaqti: <b>{end_local}</b>\n\n"
+        f"Kim ko'p odam qo'shsa — g'olib!\n"
+        f"Vaqt kelganda avtomatik e'lon qilinadi.",
+        reply_markup=admin_keyboard(), parse_mode="HTML"
+    )
+    await admin_log(ADMIN_ID, "ref_contest_created", f"end_at={end_local}")
+
+
+@router.callback_query(F.data.startswith("finish_ref_"))
+async def finish_ref_contest_cb(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    contest_id = call.data[len("finish_ref_"):]
+    contest    = await contests.find_one({"_id": ObjectId(contest_id)})
+    if contest:
+        await _finalize_ref_contest(contest)
+        await call.message.edit_text("✅ Konkurs yakunlandi!", reply_markup=admin_keyboard())
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("stop_ref_"))
+async def stop_ref_contest(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    contest_id = call.data[len("stop_ref_"):]
+    await contests.update_one({"_id": ObjectId(contest_id)}, {"$set": {"status": "cancelled"}})
+    await call.message.edit_text("❌ Referral konkurs bekor qilindi.", reply_markup=admin_keyboard())
+    await call.answer("Bekor qilindi!")
+
+
+async def _finalize_ref_contest(contest: dict):
+    """Referral konkursni yakunlaydi va g'olibni e'lon qiladi."""
+    await contests.update_one({"_id": contest["_id"]}, {"$set": {"status": "finished"}})
+    pipeline = [
+        {"$match": {"contest_id": contest["_id"]}},
+        {"$group": {"_id": "$referrer_id", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 10}
+    ]
+    top = await contest_refs_col.aggregate(pipeline).to_list(10)
+    if not top:
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                "🏆 <b>Referral Konkurs Yakunlandi</b>\n\nHech kim qatnashmadi.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+        return
+
+    medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+    lines  = ["🏆 <b>Referral Konkurs Yakunlandi!</b>\n"]
+    for i, row in enumerate(top):
+        u     = await users.find_one({"user_id": row["_id"]}, {"full_name":1,"username":1})
+        name  = (f"@{u['username']}" if u and u.get("username") else (u or {}).get("full_name","?")) if u else str(row["_id"])
+        uid   = row["_id"]
+        count = row["count"]
+        lines.append(f"{medals[i]} {name} (<code>{uid}</code>) — <b>{count} ta</b> referral")
+
+    lines.append(f"\n🎉 G'olib: <b>{lines[1][2:].split('(')[0].strip()}</b>")
+    try:
+        await bot.send_message(ADMIN_ID, "\n".join(lines), parse_mode="HTML")
+    except Exception:
+        pass
+
+
+async def check_ref_contest_deadline():
+    """Har daqiqada referral konkurs deadlineni tekshiradi."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            now     = datetime.now(timezone.utc)
+            contest = await contests.find_one({
+                "type":   "referral",
+                "status": "active",
+                "end_at": {"$lte": now}
+            })
+            if contest:
+                await _finalize_ref_contest(contest)
+        except Exception as e:
+            logger.error(f"check_ref_contest_deadline xato: {e}")
+        await asyncio.sleep(60)
+
+
 # ===================== KANAL SOGLIGI TEKSHIRUVI =====================
 
 async def check_channel_health():
@@ -2912,6 +3273,7 @@ async def main():
 
     asyncio.create_task(auto_check_subscriptions())
     asyncio.create_task(check_channel_health())
+    asyncio.create_task(check_ref_contest_deadline())
 
     logger.info("✅ Bot ishga tushdi!")
     await dp.start_polling(bot, skip_updates=True)
