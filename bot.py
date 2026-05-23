@@ -12,7 +12,7 @@ from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ChatJoinRequest, TelegramObject,
+    ChatJoinRequest, TelegramObject, BotCommand,
 )
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramNotFound, TelegramBadRequest
 from aiogram.fsm.context import FSMContext
@@ -33,6 +33,7 @@ TIMEZONE      = pytz.timezone("Asia/Tashkent")
 DB_NAME       = os.environ.get("DB_NAME", "starsbot")
 
 MIN_REFERRALS_FOR_GIFT = 3  # default, DB dan o'qiladi
+_our_channel_url: str = SUPPORT_GROUP  # admin paneldan o'zgartiriladi
 # ======================================================
 
 
@@ -142,6 +143,17 @@ async def init_db():
         [("contest_id", 1), ("referred_id", 1)], unique=True
     )
     await contest_refs_col.create_index([("contest_id", 1), ("referrer_id", 1)])
+
+    await settings_col.update_one(
+        {"key": "our_channel"},
+        {"$setOnInsert": {"key": "our_channel", "value": SUPPORT_GROUP}},
+        upsert=True
+    )
+    global _our_channel_url
+    oc = await settings_col.find_one({"key": "our_channel"})
+    if oc:
+        _our_channel_url = oc["value"]
+
     logger.info("✅ Indekslar tayyor!")
 
 
@@ -230,6 +242,18 @@ async def deduct_balance(user_id: int, amount: float, desc: str = "") -> bool:
         "created_at": datetime.now(timezone.utc)
     })
     return True
+
+
+async def force_deduct_balance(user_id: int, amount: float, desc: str = ""):
+    """Balans yetarli bo'lmasa ham ayiradi (manfiy balansga tushishi mumkin)."""
+    await users.update_one({"user_id": user_id}, {"$inc": {"balance": -amount}})
+    await transactions.insert_one({
+        "user_id": user_id,
+        "amount": amount,
+        "type": "debit",
+        "description": desc,
+        "created_at": datetime.now(timezone.utc)
+    })
 
 
 async def get_balance(user_id: int) -> float:
@@ -637,6 +661,7 @@ def main_menu(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⏰ Ish vaqti",        callback_data="work_hours")],
         [InlineKeyboardButton(text="🆘 Yordam / Muammo", callback_data="support")],
         [InlineKeyboardButton(text="ℹ️ Bot haqida",      callback_data="about")],
+        [InlineKeyboardButton(text="📢 Bizning kanal",   url=_our_channel_url)],
     ]
     if user_id == ADMIN_ID:
         buttons.append([InlineKeyboardButton(text="🔧 Admin panel", callback_data="admin_panel")])
@@ -664,6 +689,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📣 Xabar yuborish",       callback_data="admin_broadcast")],
         [InlineKeyboardButton(text="👥 Foydalanuvchilar",     callback_data="admin_users")],
         [InlineKeyboardButton(text="🚫 Banlangan userlar",    callback_data="admin_banned")],
+        [InlineKeyboardButton(text="📢 Bizning kanal sozla",  callback_data="admin_our_channel")],
         [InlineKeyboardButton(text="🔙 Ortga",                callback_data="back_main")],
     ])
 
@@ -894,6 +920,26 @@ async def cmd_cancel(message: Message, state: FSMContext):
         await message.answer("❌ Bekor qilindi.", reply_markup=main_menu(message.from_user.id), parse_mode="HTML")
     else:
         await message.answer("🏠 Bosh sahifa:", reply_markup=main_menu(message.from_user.id), parse_mode="HTML")
+
+
+@router.message(Command("balansim"))
+async def cmd_balansim(message: Message):
+    user_id = message.from_user.id
+    balance = await get_balance(user_id)
+    can_daily, can_spin, d_left, s_left = await _daily_status(user_id)
+    daily_txt = "✅ Tayyor" if can_daily else f"⏳ {_fmt_seconds(d_left)}"
+    spin_txt  = "✅ Tayyor" if can_spin  else f"⏳ {_fmt_seconds(s_left)}"
+    await message.answer(
+        f"⭐ <b>Balansingiz</b>\n\n"
+        f"💰 Balans: <b>{balance}⭐</b>\n\n"
+        f"🎁 Kunlik bonus: {daily_txt}\n"
+        f"🎰 Omad g'ildiragi: {spin_txt}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎰 Kunlik sovg'alar", callback_data="daily_menu")],
+            [InlineKeyboardButton(text="🔙 Bosh sahifa",      callback_data="back_main")],
+        ]),
+        parse_mode="HTML"
+    )
 
 
 @router.callback_query(F.data == "about")
@@ -2730,6 +2776,41 @@ async def admin_unban_user(call: CallbackQuery):
     await admin_banned_list(call)
 
 
+@router.callback_query(F.data == "admin_our_channel")
+async def admin_our_channel_handler(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.set_our_channel)
+    await call.message.edit_text(
+        f"📢 <b>Bizning kanal havolasini o'zgartirish</b>\n\n"
+        f"Hozirgi havola:\n<code>{_our_channel_url}</code>\n\n"
+        f"Yangi havola yuboring (masalan: <code>https://t.me/yourchannel</code>)\n\n"
+        f"<i>Bekor qilish: /cancel</i>",
+        reply_markup=back_kb("admin_panel"), parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.message(AdminStates.set_our_channel)
+async def process_our_channel(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    global _our_channel_url
+    new_url = (message.text or "").strip()
+    if not new_url.startswith("http"):
+        await message.answer("❌ Havola http yoki https bilan boshlanishi kerak.", parse_mode="HTML")
+        return
+    _our_channel_url = new_url
+    await set_setting("our_channel", new_url)
+    await state.clear()
+    await message.answer(
+        f"✅ <b>Bizning kanal havolasi yangilandi!</b>\n\n"
+        f"<code>{new_url}</code>",
+        reply_markup=admin_keyboard(), parse_mode="HTML"
+    )
+    await admin_log(ADMIN_ID, "our_channel_set", new_url)
+
+
 @router.callback_query(F.data == "admin_add_balance")
 async def admin_add_balance(call: CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -3469,24 +3550,23 @@ async def auto_check_subscriptions():
                             "user_id": user_id, "channel_id": channel_id_str
                         })
                         if not ok and bonus_doc:
-                            given           = float(bonus_doc.get("stars_given", sub_stars))
+                            given = float(bonus_doc.get("stars_given", sub_stars))
                             await channel_bonus.delete_one({"user_id": user_id, "channel_id": channel_id_str})
-                            current_balance = await get_balance(user_id)
-                            deduct_amount   = min(given, current_balance)
-                            if deduct_amount > 0:
-                                await deduct_balance(user_id, deduct_amount, f"Kanal tark etildi: {channel_name}")
-                                try:
-                                    await bot.send_message(
-                                        user_id,
-                                        f"❌ <b>{channel_name}</b> kanalini tark etgansiz!\n"
-                                        f"💸 -{deduct_amount}⭐ ayirildi.",
-                                        parse_mode="HTML"
-                                    )
-                                except TelegramRetryAfter as e:
-                                    await asyncio.sleep(e.retry_after + 1)
-                                except Exception:
-                                    pass
-                                await asyncio.sleep(0.1)  # xabar yuborilgandan keyin kut
+                            await force_deduct_balance(user_id, given, f"Kanal tark etildi: {channel_name}")
+                            new_bal = await get_balance(user_id)
+                            debt_txt = f"\n⚠️ Qarz: <b>{abs(new_bal):.2f}⭐</b> — balansni to'ldiring!" if new_bal < 0 else ""
+                            try:
+                                await bot.send_message(
+                                    user_id,
+                                    f"❌ <b>{channel_name}</b> kanalini tark etgansiz!\n"
+                                    f"💸 <b>-{given}⭐</b> ayirildi.{debt_txt}",
+                                    parse_mode="HTML"
+                                )
+                            except TelegramRetryAfter as e:
+                                await asyncio.sleep(e.retry_after + 1)
+                            except Exception:
+                                pass
+                            await asyncio.sleep(0.1)  # xabar yuborilgandan keyin kut
                         await asyncio.sleep(0.1)  # har API call orasida
         except Exception as e:
             logger.error(f"auto_check xato: {e}")
@@ -3518,6 +3598,12 @@ async def main():
     asyncio.create_task(check_channel_health())
     asyncio.create_task(check_ref_contest_deadline())
     asyncio.create_task(send_reminders())
+
+    await bot.set_my_commands([
+        BotCommand(command="start",    description="Botni boshlash / Bosh sahifa"),
+        BotCommand(command="balansim", description="Balansingizni ko'rish"),
+        BotCommand(command="cancel",   description="Amalni bekor qilish"),
+    ])
 
     logger.info("✅ Bot ishga tushdi!")
     await dp.start_polling(bot, skip_updates=True)
