@@ -185,6 +185,7 @@ async def add_user(user_id: int, username: str, full_name: str, referred_by=None
             "$set": {
                 "username": username,
                 "full_name": full_name,
+                "last_active": datetime.now(timezone.utc),
             },
             "$setOnInsert": {
                 "user_id": user_id,
@@ -330,6 +331,11 @@ async def unban_user(user_id: int):
 
 
 async def check_referral_abuse(referred_by: int) -> bool:
+    # Allaqachon banlangan bo'lsa — hech narsa qilma
+    user_doc = await users.find_one({"user_id": referred_by}, {"is_banned": 1})
+    if user_doc and user_doc.get("is_banned"):
+        return False
+
     # 1 daqiqada 15 dan ortiq referral → ban
     minute_key = datetime.now(TIMEZONE).strftime("%Y%m%d%H%M")
     min_doc = await referral_minute.find_one_and_update(
@@ -342,18 +348,25 @@ async def check_referral_abuse(referred_by: int) -> bool:
         return_document=ReturnDocument.AFTER
     )
     if min_doc["count"] > 15:
-        await ban_user(referred_by, "1 daqiqada 15+ referral spam")
-        try:
-            await bot.send_message(
-                ADMIN_ID,
-                f"🚫 <b>Spam aniqlandi!</b>\n\n"
-                f"👤 User: <code>{referred_by}</code>\n"
-                f"⚡ 1 daqiqada <b>{min_doc['count']} ta</b> referral yubordi\n"
-                f"🔒 Avtomatik ban qilindi!",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
+        # Faqat birinchi oshib ketganda ban va 1 ta xabar
+        if min_doc["count"] == 16:
+            await ban_user(referred_by, "1 daqiqada 15+ referral spam")
+            u = await users.find_one({"user_id": referred_by}, {"username": 1, "full_name": 1})
+            uname = f"@{u['username']}" if u and u.get("username") else str(referred_by)
+            try:
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"🚫 <b>Spam aniqlandi!</b>\n\n"
+                    f"👤 {uname} (<code>{referred_by}</code>)\n"
+                    f"⚡ 1 daqiqada <b>15+ ta</b> odam uning nomidan kirdi\n"
+                    f"🔒 Avtomatik ban qilindi!",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="✅ Bandan chiqarish", callback_data=f"unban_u_{referred_by}")
+                    ]]),
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
         return False
 
     # Soatiga 5 dan ortiq referral → rad etish (ban emas)
@@ -565,6 +578,7 @@ class AdminStates(StatesGroup):
     send_user_msg        = State()
     slot_contest_setup   = State()
     ref_contest_setup    = State()
+    set_our_channel      = State()
 
 
 class UserStates(StatesGroup):
@@ -612,6 +626,7 @@ def main_menu(user_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="👥 Referral",      callback_data="referral"),
         ],
         [InlineKeyboardButton(text="🎁 Gift olish",       callback_data="buy_gift")],
+        [InlineKeyboardButton(text="🎰 Kunlik sovg'a",    callback_data="daily_menu")],
         [InlineKeyboardButton(text="📢 Kanallarga obuna", callback_data="channels")],
         [InlineKeyboardButton(text="🎮 PUBG UC",             callback_data="exchange_pubg")],
         [InlineKeyboardButton(text="📋 Transaksiyalar",   callback_data="transactions")],
@@ -1226,10 +1241,21 @@ async def show_channels(call: CallbackQuery):
     await render_channels_menu(call.from_user.id, call.message)
 
 
+_check_sub_cooldown: dict[int, float] = {}  # user_id → last_check timestamp
+
 @router.callback_query(F.data == "check_sub")
 async def check_all_subs(call: CallbackQuery):
     """Barcha kanallarni tekshirish."""
-    user_id   = call.from_user.id
+    import time
+    user_id = call.from_user.id
+    now_ts  = time.monotonic()
+    last    = _check_sub_cooldown.get(user_id, 0)
+    if now_ts - last < 30:
+        left = int(30 - (now_ts - last))
+        await call.answer(f"⏳ {left} soniyadan so'ng tekshiring.", show_alert=True)
+        return
+    _check_sub_cooldown[user_id] = now_ts
+
     chs       = await get_channels()
     sub_stars = float(await get_setting("subscribe_stars") or 0.10)
 
@@ -1789,6 +1815,7 @@ async def done_exchange(call: CallbackQuery):
 async def back_main(call: CallbackQuery, state: FSMContext):
     await state.clear()
     user_id   = call.from_user.id
+    await users.update_one({"user_id": user_id}, {"$set": {"last_active": datetime.now(timezone.utc)}})
     balance   = await get_balance(user_id)
     ref_stars = await get_setting("referral_stars") or "0.25"
     sub_stars = await get_setting("subscribe_stars") or "0.10"
@@ -1804,6 +1831,216 @@ async def back_main(call: CallbackQuery, state: FSMContext):
         reply_markup=main_menu(user_id), parse_mode="HTML"
     )
     await call.answer()
+
+
+# ===================== KUNLIK SOVGA + OMAD G'ILDIRAGI =====================
+
+SPIN_PRIZES = [
+    {"amount": 0.10, "label": "0.1⭐",  "weight": 40},
+    {"amount": 0.25, "label": "0.25⭐", "weight": 30},
+    {"amount": 0.50, "label": "0.5⭐",  "weight": 15},
+    {"amount": 1.00, "label": "1⭐",    "weight": 10},
+    {"amount": 2.00, "label": "2⭐",    "weight": 4},
+    {"amount": 5.00, "label": "5⭐",    "weight": 1},
+]
+
+def _spin_weighted_random() -> dict:
+    import random
+    pool = []
+    for prize in SPIN_PRIZES:
+        pool.extend([prize] * prize["weight"])
+    return random.choice(pool)
+
+
+async def _daily_status(user_id: int) -> tuple[bool, bool, int, int]:
+    """(can_daily, can_spin, daily_secs_left, spin_secs_left)"""
+    now = datetime.now(timezone.utc)
+    u = await users.find_one({"user_id": user_id}, {"last_daily_at": 1, "last_spin_at": 1})
+    if not u:
+        return True, True, 0, 0
+
+    daily_last = ensure_utc(u.get("last_daily_at"))
+    spin_last  = ensure_utc(u.get("last_spin_at"))
+    day = timedelta(hours=24)
+
+    can_daily = (now - daily_last) >= day
+    can_spin  = (now - spin_last)  >= day
+    daily_left = max(0, int((daily_last + day - now).total_seconds())) if not can_daily else 0
+    spin_left  = max(0, int((spin_last  + day - now).total_seconds())) if not can_spin  else 0
+    return can_daily, can_spin, daily_left, spin_left
+
+
+def _fmt_seconds(secs: int) -> str:
+    h, r = divmod(secs, 3600)
+    m, s = divmod(r, 60)
+    return f"{h}s {m}d {s}s" if h else f"{m}d {s}s"
+
+
+@router.callback_query(F.data == "daily_menu")
+async def daily_menu_handler(call: CallbackQuery):
+    user_id = call.from_user.id
+    can_daily, can_spin, d_left, s_left = await _daily_status(user_id)
+
+    daily_txt = "✅ Tayyor!" if can_daily else f"⏳ {_fmt_seconds(d_left)}"
+    spin_txt  = "✅ Tayyor!" if can_spin  else f"⏳ {_fmt_seconds(s_left)}"
+
+    buttons = []
+    if can_daily:
+        buttons.append([InlineKeyboardButton(text="🎁 Kunlik bonus olish (+0.5⭐)", callback_data="claim_daily")])
+    else:
+        buttons.append([InlineKeyboardButton(text=f"🎁 Kunlik bonus — {daily_txt}", callback_data="daily_menu")])
+
+    if can_spin:
+        buttons.append([InlineKeyboardButton(text="🎰 Omad g'ildiragini aylantir!", callback_data="claim_spin")])
+    else:
+        buttons.append([InlineKeyboardButton(text=f"🎰 Omad g'ildiragi — {spin_txt}", callback_data="daily_menu")])
+
+    buttons.append([InlineKeyboardButton(text="🔙 Ortga", callback_data="back_main")])
+
+    await call.message.edit_text(
+        "🎰 <b>Kunlik Sovg'alar</b>\n\n"
+        f"🎁 <b>Kunlik bonus:</b> {daily_txt}\n"
+        f"   Har 24 soatda +0.5⭐ bepul!\n\n"
+        f"🎰 <b>Omad g'ildiragi:</b> {spin_txt}\n"
+        f"   0.1⭐ dan 5⭐ gacha yutib olish!\n\n"
+        f"<i>Har kuni qaytib keling — har kuni sovg'a!</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "claim_daily")
+async def claim_daily_handler(call: CallbackQuery):
+    user_id = call.from_user.id
+    now     = datetime.now(timezone.utc)
+    cutoff  = now - timedelta(hours=24)
+
+    result = await users.find_one_and_update(
+        {"user_id": user_id, "$or": [
+            {"last_daily_at": {"$exists": False}},
+            {"last_daily_at": None},
+            {"last_daily_at": {"$lt": cutoff}},
+        ]},
+        {"$set": {"last_daily_at": now}},
+        return_document=ReturnDocument.AFTER
+    )
+    if result is None:
+        _, _, d_left, _ = await _daily_status(user_id)
+        await call.answer(f"⏳ Kunlik bonus {_fmt_seconds(d_left)} dan so'ng!", show_alert=True)
+        return
+
+    await add_balance(user_id, 0.5, "Kunlik bonus")
+    balance = await get_balance(user_id)
+    await call.message.edit_text(
+        "🎁 <b>Kunlik Bonus!</b>\n\n"
+        f"🎉 <b>+0.5⭐</b> hisobingizga qo'shildi!\n"
+        f"💰 Yangi balans: <b>{balance}⭐</b>\n\n"
+        f"<i>Ertaga yana keling!</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎰 Omad g'ildiragini aylantir!", callback_data="claim_spin")],
+            [InlineKeyboardButton(text="🔙 Ortga", callback_data="daily_menu")],
+        ]),
+        parse_mode="HTML"
+    )
+    await call.answer("🎁 +0.5⭐ qo'shildi!")
+
+
+@router.callback_query(F.data == "claim_spin")
+async def claim_spin_handler(call: CallbackQuery):
+    user_id = call.from_user.id
+    now     = datetime.now(timezone.utc)
+    cutoff  = now - timedelta(hours=24)
+
+    result = await users.find_one_and_update(
+        {"user_id": user_id, "$or": [
+            {"last_spin_at": {"$exists": False}},
+            {"last_spin_at": None},
+            {"last_spin_at": {"$lt": cutoff}},
+        ]},
+        {"$set": {"last_spin_at": now}},
+        return_document=ReturnDocument.AFTER
+    )
+    if result is None:
+        _, _, _, s_left = await _daily_status(user_id)
+        await call.answer(f"⏳ G'ildiraq {_fmt_seconds(s_left)} dan so'ng!", show_alert=True)
+        return
+
+    prize = _spin_weighted_random()
+    await add_balance(user_id, prize["amount"], f"Omad g'ildiragi: {prize['label']}")
+    balance = await get_balance(user_id)
+
+    reel = "🍒 🍋 ⭐ 🎰 💫 🎁 🌟 ⚡"
+
+    await call.message.edit_text(
+        f"🎰 <b>Omad G'ildiragi!</b>\n\n"
+        f"<b>{reel}</b>\n\n"
+        f"🎉 Tabriklaymiz!\n"
+        f"✨ <b>+{prize['label']}</b> yutdingiz!\n"
+        f"💰 Yangi balans: <b>{balance}⭐</b>\n\n"
+        f"<i>Ertaga yana o'ynang!</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎁 Kunlik bonusga qaytish", callback_data="daily_menu")],
+            [InlineKeyboardButton(text="🔙 Bosh sahifa", callback_data="back_main")],
+        ]),
+        parse_mode="HTML"
+    )
+    await call.answer(f"🎉 {prize['label']} yutdingiz!")
+
+
+# ===================== AUTO REMINDER =====================
+
+async def send_reminders():
+    """Har 2 soatda 24 soat kirmagan foydalanuvchilarga eslatma yuboradi."""
+    await asyncio.sleep(3600)  # Botni ishga tushirishdan 1 soat o'tgach boshlash
+    while True:
+        try:
+            now    = datetime.now(timezone.utc)
+            cutoff = now - timedelta(hours=24)
+            reminder_cutoff = now - timedelta(hours=24)
+
+            cursor = users.find(
+                {
+                    "is_banned": {"$ne": True},
+                    "last_active": {"$lt": cutoff},
+                    "$or": [
+                        {"last_reminder_at": {"$exists": False}},
+                        {"last_reminder_at": None},
+                        {"last_reminder_at": {"$lt": reminder_cutoff}},
+                    ]
+                },
+                {"user_id": 1}
+            )
+            user_ids = [doc["user_id"] async for doc in cursor]
+            logger.info(f"📢 Eslatma yuborish: {len(user_ids)} ta foydalanuvchi")
+
+            for uid in user_ids:
+                try:
+                    await bot.send_message(
+                        uid,
+                        "⭐ <b>Balansingiz siz kutmoqda!</b>\n\n"
+                        "Starslarni yeg'ishda davom eting — "
+                        "kunlik bonus va omad g'ildiragingiz kutmoqda! 🎰\n\n"
+                        "👇 Botga kiring:",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="🎰 Kunlik sovg'alar", callback_data="daily_menu")],
+                        ]),
+                        parse_mode="HTML"
+                    )
+                    await users.update_one(
+                        {"user_id": uid},
+                        {"$set": {"last_reminder_at": now}}
+                    )
+                except TelegramForbiddenError:
+                    pass
+                except TelegramRetryAfter as e:
+                    await asyncio.sleep(e.retry_after + 1)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.15)
+        except Exception as e:
+            logger.error(f"send_reminders xato: {e}")
+        await asyncio.sleep(2 * 3600)  # har 2 soatda
 
 
 # ===================== ADMIN HANDLERS =====================
@@ -3224,8 +3461,11 @@ async def auto_check_subscriptions():
                     for ch in chs:
                         channel_id_str = ch["channel_id"]
                         channel_name   = ch["channel_name"]
-                        ok             = await is_member(channel_id_str, user_id)
-                        bonus_doc      = await channel_bonus.find_one({
+                        try:
+                            ok = await is_member(channel_id_str, user_id)
+                        except Exception:
+                            ok = True  # xato bo'lsa tekshirishni o'tkazib yubor
+                        bonus_doc = await channel_bonus.find_one({
                             "user_id": user_id, "channel_id": channel_id_str
                         })
                         if not ok and bonus_doc:
@@ -3242,9 +3482,12 @@ async def auto_check_subscriptions():
                                         f"💸 -{deduct_amount}⭐ ayirildi.",
                                         parse_mode="HTML"
                                     )
+                                except TelegramRetryAfter as e:
+                                    await asyncio.sleep(e.retry_after + 1)
                                 except Exception:
                                     pass
-                        await asyncio.sleep(0.05)
+                                await asyncio.sleep(0.1)  # xabar yuborilgandan keyin kut
+                        await asyncio.sleep(0.1)  # har API call orasida
         except Exception as e:
             logger.error(f"auto_check xato: {e}")
         logger.info("✅ Tekshiruv tugadi.")
@@ -3274,6 +3517,7 @@ async def main():
     asyncio.create_task(auto_check_subscriptions())
     asyncio.create_task(check_channel_health())
     asyncio.create_task(check_ref_contest_deadline())
+    asyncio.create_task(send_reminders())
 
     logger.info("✅ Bot ishga tushdi!")
     await dp.start_polling(bot, skip_updates=True)
