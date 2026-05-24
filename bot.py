@@ -393,18 +393,7 @@ async def check_referral_abuse(referred_by: int) -> bool:
                 pass
         return False
 
-    # Soatiga 5 dan ortiq referral → rad etish (ban emas)
-    hour_key = datetime.now(TIMEZONE).strftime("%Y%m%d%H")
-    doc = await referral_hourly.find_one_and_update(
-        {"referrer_id": referred_by, "hour_key": hour_key},
-        {
-            "$inc": {"count": 1},
-            "$setOnInsert": {"created_at": datetime.now(timezone.utc)}
-        },
-        upsert=True,
-        return_document=ReturnDocument.AFTER
-    )
-    return doc["count"] <= 5
+    return True
 
 
 async def check_order_cooldown(user_id: int) -> bool:
@@ -661,6 +650,7 @@ def main_menu(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⏰ Ish vaqti",        callback_data="work_hours")],
         [InlineKeyboardButton(text="🆘 Yordam / Muammo", callback_data="support")],
         [InlineKeyboardButton(text="ℹ️ Bot haqida",      callback_data="about")],
+        [InlineKeyboardButton(text="📣 Reklama",          callback_data="ads_info")],
         [InlineKeyboardButton(text="📢 Bizning kanal",   url=_our_channel_url)],
     ]
     if user_id == ADMIN_ID:
@@ -964,6 +954,36 @@ async def about_handler(call: CallbackQuery):
         f"<b>Qo'llab-quvvatlash:</b>\n"
         f"💬 {SUPPORT_GROUP}",
         reply_markup=back_kb(), parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "ads_info")
+async def ads_info_handler(call: CallbackQuery):
+    await call.message.edit_text(
+        "Assalomu alaykum 👋\n\n"
+        "<b>Reklama narxlari 💰</b>\n\n"
+        "<b>Telegram kanallar va guruhlar uchun:</b>\n"
+        "1000 ta obunachi — 100 ming 💸\n"
+        "3000 ta obunachi — 280 ming 💸\n"
+        "5000 ta obunachi — 450 ming 💸\n\n"
+        "<b>Instagram uchun 🌐:</b>\n"
+        "1000 ta obunachi — 200 ming 💸\n"
+        "2000 ta obunachi — 380 ming 💸\n"
+        "3000 ta obunachi — 550 ming 💸\n\n"
+        "<b>YouTube uchun 📲:</b>\n"
+        "1000 ta obunachi — 250 ming 💸\n"
+        "2000 ta obunachi — 450 ming 💸\n\n"
+        "✅ 100% jonli obunachilar (Uzb obunachilar)\n"
+        "⚙️ Kanalga qarab narxlar o'zgarishi mumkin\n\n"
+        "🛠 Zayafka kanal ham qilib beramiz — 10K: 500 ming 💸\n\n"
+        "Narxlar bilan tanishib keyin adminga yozing 📩\n\n"
+        "👤 Admin: @Ulugbeck_dev",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📩 Adminga yozish", url="https://t.me/Ulugbeck_dev")],
+            [InlineKeyboardButton(text="🔙 Ortga", callback_data="back_main")],
+        ]),
+        parse_mode="HTML"
     )
     await call.answer()
 
@@ -1905,14 +1925,24 @@ async def _daily_status(user_id: int) -> tuple[bool, bool, int, int]:
     if not u:
         return True, True, 0, 0
 
-    daily_last = ensure_utc(u.get("last_daily_at"))
-    spin_last  = ensure_utc(u.get("last_spin_at"))
     day = timedelta(hours=24)
 
-    can_daily = (now - daily_last) >= day
-    can_spin  = (now - spin_last)  >= day
-    daily_left = max(0, int((daily_last + day - now).total_seconds())) if not can_daily else 0
-    spin_left  = max(0, int((spin_last  + day - now).total_seconds())) if not can_spin  else 0
+    raw_daily = u.get("last_daily_at")
+    if raw_daily is None:
+        can_daily, daily_left = True, 0
+    else:
+        daily_last = ensure_utc(raw_daily)
+        can_daily  = (now - daily_last) >= day
+        daily_left = max(0, int((daily_last + day - now).total_seconds())) if not can_daily else 0
+
+    raw_spin = u.get("last_spin_at")
+    if raw_spin is None:
+        can_spin, spin_left = True, 0
+    else:
+        spin_last = ensure_utc(raw_spin)
+        can_spin  = (now - spin_last) >= day
+        spin_left = max(0, int((spin_last + day - now).total_seconds())) if not can_spin else 0
+
     return can_daily, can_spin, daily_left, spin_left
 
 
