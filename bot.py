@@ -154,6 +154,12 @@ async def init_db():
     if oc:
         _our_channel_url = oc["value"]
 
+    await settings_col.update_one(
+        {"key": "daily_bonus"},
+        {"$setOnInsert": {"key": "daily_bonus", "value": "0.5"}},
+        upsert=True
+    )
+
     logger.info("✅ Indekslar tayyor!")
 
 
@@ -592,6 +598,7 @@ class AdminStates(StatesGroup):
     slot_contest_setup   = State()
     ref_contest_setup    = State()
     set_our_channel      = State()
+    set_daily_bonus      = State()
 
 
 class UserStates(StatesGroup):
@@ -680,6 +687,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="👥 Foydalanuvchilar",     callback_data="admin_users")],
         [InlineKeyboardButton(text="🚫 Banlangan userlar",    callback_data="admin_banned")],
         [InlineKeyboardButton(text="📢 Bizning kanal sozla",  callback_data="admin_our_channel")],
+        [InlineKeyboardButton(text="🎁 Kunlik bonus sozla",   callback_data="admin_set_daily_bonus")],
         [InlineKeyboardButton(text="🔙 Ortga",                callback_data="back_main")],
     ])
 
@@ -1910,12 +1918,21 @@ SPIN_PRIZES = [
     {"amount": 5.00, "label": "5⭐",    "weight": 1},
 ]
 
-def _spin_weighted_random() -> dict:
-    import random
-    pool = []
-    for prize in SPIN_PRIZES:
-        pool.extend([prize] * prize["weight"])
-    return random.choice(pool)
+def _dice_to_prize(value: int) -> dict:
+    """Telegram 🎰 dice qiymatidan (1-64) mukofot aniqlaydi.
+    64 = 7-7-7 jackpot (Telegram slot machine max)."""
+    if value <= 26:
+        return SPIN_PRIZES[0]   # 0.1⭐  ~40%
+    elif value <= 45:
+        return SPIN_PRIZES[1]   # 0.25⭐ ~30%
+    elif value <= 55:
+        return SPIN_PRIZES[2]   # 0.5⭐  ~16%
+    elif value <= 61:
+        return SPIN_PRIZES[3]   # 1⭐    ~9%
+    elif value <= 63:
+        return SPIN_PRIZES[4]   # 2⭐    ~3%
+    else:
+        return SPIN_PRIZES[5]   # 5⭐    ~2% (64 = jackpot)
 
 
 async def _daily_status(user_id: int) -> tuple[bool, bool, int, int]:
@@ -1956,13 +1973,14 @@ def _fmt_seconds(secs: int) -> str:
 async def daily_menu_handler(call: CallbackQuery):
     user_id = call.from_user.id
     can_daily, can_spin, d_left, s_left = await _daily_status(user_id)
+    bonus_amt = float(await get_setting("daily_bonus") or 0.5)
 
     daily_txt = "✅ Tayyor!" if can_daily else f"⏳ {_fmt_seconds(d_left)}"
     spin_txt  = "✅ Tayyor!" if can_spin  else f"⏳ {_fmt_seconds(s_left)}"
 
     buttons = []
     if can_daily:
-        buttons.append([InlineKeyboardButton(text="🎁 Kunlik bonus olish (+0.5⭐)", callback_data="claim_daily")])
+        buttons.append([InlineKeyboardButton(text=f"🎁 Kunlik bonus olish (+{bonus_amt:g}⭐)", callback_data="claim_daily")])
     else:
         buttons.append([InlineKeyboardButton(text=f"🎁 Kunlik bonus — {daily_txt}", callback_data="daily_menu")])
 
@@ -1976,7 +1994,7 @@ async def daily_menu_handler(call: CallbackQuery):
     await call.message.edit_text(
         "🎰 <b>Kunlik Sovg'alar</b>\n\n"
         f"🎁 <b>Kunlik bonus:</b> {daily_txt}\n"
-        f"   Har 24 soatda +0.5⭐ bepul!\n\n"
+        f"   Har 24 soatda +{bonus_amt:g}⭐ bepul!\n\n"
         f"🎰 <b>Omad g'ildiragi:</b> {spin_txt}\n"
         f"   0.1⭐ dan 5⭐ gacha yutib olish!\n\n"
         f"<i>Har kuni qaytib keling — har kuni sovg'a!</i>",
@@ -2006,11 +2024,12 @@ async def claim_daily_handler(call: CallbackQuery):
         await call.answer(f"⏳ Kunlik bonus {_fmt_seconds(d_left)} dan so'ng!", show_alert=True)
         return
 
-    await add_balance(user_id, 0.5, "Kunlik bonus")
+    bonus_amt = float(await get_setting("daily_bonus") or 0.5)
+    await add_balance(user_id, bonus_amt, "Kunlik bonus")
     balance = await get_balance(user_id)
     await call.message.edit_text(
         "🎁 <b>Kunlik Bonus!</b>\n\n"
-        f"🎉 <b>+0.5⭐</b> hisobingizga qo'shildi!\n"
+        f"🎉 <b>+{bonus_amt:g}⭐</b> hisobingizga qo'shildi!\n"
         f"💰 Yangi balans: <b>{balance}⭐</b>\n\n"
         f"<i>Ertaga yana keling!</i>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -2019,7 +2038,7 @@ async def claim_daily_handler(call: CallbackQuery):
         ]),
         parse_mode="HTML"
     )
-    await call.answer("🎁 +0.5⭐ qo'shildi!")
+    await call.answer(f"🎁 +{bonus_amt:g}⭐ qo'shildi!")
 
 
 @router.callback_query(F.data == "claim_spin")
@@ -2042,26 +2061,52 @@ async def claim_spin_handler(call: CallbackQuery):
         await call.answer(f"⏳ G'ildiraq {_fmt_seconds(s_left)} dan so'ng!", show_alert=True)
         return
 
-    prize = _spin_weighted_random()
+    await call.answer("🎰 Aylanmoqda...")
+    await call.message.edit_text(
+        "🎰 <b>Omad G'ildiragi</b>\n\n"
+        "⏳ <i>G'ildirak aylanmoqda...</i>",
+        parse_mode="HTML"
+    )
+
+    dice_msg = await call.bot.send_dice(call.message.chat.id, emoji="🎰")
+    prize = _dice_to_prize(dice_msg.dice.value)
+
+    await asyncio.sleep(3)
+
     await add_balance(user_id, prize["amount"], f"Omad g'ildiragi: {prize['label']}")
     balance = await get_balance(user_id)
 
-    reel = "🍒 🍋 ⭐ 🎰 💫 🎁 🌟 ⚡"
+    if prize["amount"] >= 5.0:
+        header = "🏆 JACKPOT!!!"
+        sub    = "Siz eng katta yutuqni qo'lga kiritdingiz!"
+    elif prize["amount"] >= 2.0:
+        header = "🎉 Katta yutuq!"
+        sub    = "Zo'r natija!"
+    elif prize["amount"] >= 1.0:
+        header = "✨ Yaxshi natija!"
+        sub    = "Davom eting!"
+    else:
+        header = "🎁 Tabriklaymiz!"
+        sub    = "Ertaga yana o'ynang!"
+
+    try:
+        await dice_msg.delete()
+    except Exception:
+        pass
 
     await call.message.edit_text(
-        f"🎰 <b>Omad G'ildiragi!</b>\n\n"
-        f"<b>{reel}</b>\n\n"
-        f"🎉 Tabriklaymiz!\n"
-        f"✨ <b>+{prize['label']}</b> yutdingiz!\n"
+        f"🎰 <b>Omad G'ildiragi</b>\n\n"
+        f"{header}\n"
+        f"<b>+{prize['label']}</b> yutdingiz!\n"
+        f"{sub}\n\n"
         f"💰 Yangi balans: <b>{balance}⭐</b>\n\n"
         f"<i>Ertaga yana o'ynang!</i>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🎁 Kunlik bonusga qaytish", callback_data="daily_menu")],
+            [InlineKeyboardButton(text="🎁 Kunlik bonus", callback_data="daily_menu")],
             [InlineKeyboardButton(text="🔙 Bosh sahifa", callback_data="back_main")],
         ]),
         parse_mode="HTML"
     )
-    await call.answer(f"🎉 {prize['label']} yutdingiz!")
 
 
 # ===================== AUTO REMINDER =====================
@@ -2839,6 +2884,40 @@ async def process_our_channel(message: Message, state: FSMContext):
         reply_markup=admin_keyboard(), parse_mode="HTML"
     )
     await admin_log(ADMIN_ID, "our_channel_set", new_url)
+
+
+@router.callback_query(F.data == "admin_set_daily_bonus")
+async def admin_set_daily_bonus(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    current = await get_setting("daily_bonus") or "0.5"
+    await state.set_state(AdminStates.set_daily_bonus)
+    await call.message.edit_text(
+        f"🎁 <b>Kunlik bonus miqdori</b>\n\n"
+        f"Hozirgi: <b>{current}⭐</b>\n\n"
+        f"Yangi miqdor kiriting (masalan: <code>1</code> yoki <code>0.5</code>):",
+        reply_markup=back_kb("admin_panel"), parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.message(AdminStates.set_daily_bonus)
+async def process_daily_bonus(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        val = float(message.text.strip().replace(",", "."))
+        if val <= 0:
+            raise ValueError
+        await set_setting("daily_bonus", val)
+        await state.clear()
+        await message.answer(
+            f"✅ Kunlik bonus: <b>{val:g}⭐</b>",
+            reply_markup=admin_keyboard(), parse_mode="HTML"
+        )
+        await admin_log(ADMIN_ID, "daily_bonus_set", str(val))
+    except Exception:
+        await message.answer("❌ To'g'ri son kiriting! Masalan: <code>1</code> yoki <code>0.5</code>", parse_mode="HTML")
 
 
 @router.callback_query(F.data == "admin_add_balance")
